@@ -349,9 +349,8 @@ impl Queue {
         }
         let mut dropped = None;
         let mut warn = false;
-        if inner.waiting() >= s.opts.max
-            && let Some(old) = inner.take_oldest(true).or_else(|| inner.take_oldest(false))
-        {
+        let oldest = if inner.waiting() >= s.opts.max { inner.take_oldest(true).or_else(|| inner.take_oldest(false)) } else { None };
+        if let Some(old) = oldest {
             inner.paths.remove(&old.call.path);
             inner.stats.failed += 1;
             let now = Instant::now();
