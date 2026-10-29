@@ -2,6 +2,7 @@
 
 pub mod audio;
 pub mod config;
+pub mod engine;
 pub mod filter;
 pub mod gate;
 pub mod plugin;
