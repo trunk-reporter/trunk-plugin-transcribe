@@ -19,6 +19,7 @@ hound = "3"
 axum = "0.8"
 tokio = { version = "1", features = ["rt", "sync", "net", "time", "macros"] }
 tower-http = "0.6"
+futures-util = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 http-body-util = "0.1"

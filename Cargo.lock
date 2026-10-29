@@ -1210,6 +1210,7 @@ name = "transcribe"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "hound",
  "http-body-util",
  "reqwest",

@@ -6,6 +6,7 @@ pub mod config;
 pub mod engine;
 pub mod filter;
 pub mod gate;
+pub mod http;
 pub mod plugin;
 pub mod prompt;
 pub mod queue;
