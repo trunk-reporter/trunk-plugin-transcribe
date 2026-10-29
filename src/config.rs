@@ -215,7 +215,7 @@ pub struct ArchiveConfig {
     pub every_minutes: u32,
     /// Re-transcribe everything
     ///
-    /// Also queue calls that already have a transcript.
+    /// Make the re-transcribe button consider calls of any age, not only those within the archive days.
     pub retranscribe_everything: bool,
 }
 

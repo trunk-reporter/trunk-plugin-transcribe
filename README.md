@@ -27,7 +27,8 @@ Then open the plugin's settings and set the engine URL; nothing runs without it.
 
 ## Settings
 
-Settings are applied while the recorder runs. Keys are nested under the group names below;
+Settings are applied while the recorder runs, except the five marked (restart) below: `engine.concurrency`, `queue.max`,
+`http.port`, `http.bind` and `http.origins` take effect when recording next starts (the plugin logs a warning). Keys are nested under the group names below;
 [`examples/settings.json`](examples/settings.json) is a complete settings object.
 
 | Key | Default | |
@@ -37,7 +38,7 @@ Settings are applied while the recorder runs. Keys are nested under the group na
 | `engine.apiKey` | none | Sent as a bearer token, if the engine wants one. |
 | `engine.language` | `en` | The language spoken, as a two-letter code. |
 | `engine.timeoutSeconds` | `60` | How long to wait for the engine to answer one call (5 to 600). |
-| `engine.concurrency` | `2` | How many calls to send at once (1 to 8). |
+| `engine.concurrency` (restart) | `2` | How many calls to send at once (1 to 8). |
 | `gate.rms` | `0.01` | Calls quieter than this are skipped as silence. |
 | `gate.minSeconds` | `1.0` | Calls shorter than this are skipped. |
 | `gate.skipEncrypted` | `true` | Leave encrypted calls out. |
@@ -47,14 +48,14 @@ Settings are applied while the recorder runs. Keys are nested under the group na
 | `filter.maxWordsPerSecond` | `8.0` | A transcript with more words per second of audio than this is discarded. |
 | `filter.maxRepeat` | `4` | A word repeated more times than this in a row discards the transcript. |
 | `filter.hallucinations` | 14 phrases | Transcripts that are only one of these phrases are discarded ("Thank you for watching", "Bye", "Music", ...). |
-| `queue.max` | `2000` | How many calls may wait for the engine (at least 10). The oldest are dropped beyond it. |
+| `queue.max` (restart) | `2000` | How many calls may wait for the engine (at least 10). The oldest are dropped beyond it. |
 | `archive.days` | `7` | How far back to look for calls without a transcript (at least 1). |
 | `archive.everyMinutes` | `10` | How often to look. |
-| `archive.retranscribeEverything` | `false` | Also queue calls that already have a transcript. |
+| `archive.retranscribeEverything` | `false` | Make the re-transcribe button ignore `archive.days`. Read only by the button. |
 | `store.retentionDays` | `0` | Older transcripts are deleted. 0 keeps them for ever. |
-| `http.port` | none | Serve the transcripts on this port. Empty for no server. |
-| `http.bind` | `127.0.0.1` | The address to listen on; `127.0.0.1` keeps it to this machine. |
-| `http.origins` | none | Web pages from these origins may call the API (see CORS). |
+| `http.port` (restart) | none | Serve the transcripts on this port. Empty for no server. |
+| `http.bind` (restart) | `127.0.0.1` | The address to listen on; `127.0.0.1` keeps it to this machine. |
+| `http.origins` (restart) | none | Web pages from these origins may call the API (see CORS). |
 
 Two buttons sit on the settings form:
 
@@ -81,9 +82,11 @@ The engine's model name is asked from `GET /v1/models` and stored on each transc
 When the plugin starts, and then every `archive.everyMinutes`, it checks the last `archive.days` days of the recorder's
 call store and queues every call that has no transcript. Archive work never delays live calls.
 
-After you change the engine's model, press **Re-transcribe with the current model**: it queues every transcript whose
-recorded model differs from the engine's current one. Tick `archive.retranscribeEverything` to reach beyond the window and
-also queue calls that already have a transcript.
+After you change the engine's model, press **Re-transcribe with the current model**. It queues the transcripts with status
+`ok`, `empty` or `rejected` whose recorded model differs from the engine's current model (a transcript with no recorded
+model counts as different). Failed and skipped calls are never selected. Only calls within the last `archive.days` days
+are considered; tick `archive.retranscribeEverything` to drop that window. The box is read only by the button, not by the
+periodic pass.
 
 ## Statuses
 
@@ -92,7 +95,7 @@ Each call has one transcript record, with a `status` and sometimes a `reason`:
 | Status | Meaning |
 | --- | --- |
 | `ok` | Text is stored, with segments per radio when the engine gave word times. |
-| `skipped` | Not sent. Reason: `encrypted`, `too short`, `silent`, `system disabled`, `no audio` or `already queued`. |
+| `skipped` | Not sent. Reason: `encrypted`, `too short`, `silent`, `system disabled` or `no audio`. |
 | `empty` | The engine returned no words. |
 | `rejected` | Thrown out by a filter; the raw answer is kept, the text is not. Reason: `implausible rate`, `repetition` or `hallucination`. |
 | `failed` | Not transcribed. Reason: the engine's error, `gave up: ...`, `engine down`, `queue full` or `shutting down`. The archive pass retries it, up to 10 attempts. |
