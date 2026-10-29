@@ -243,20 +243,33 @@ impl Plugin for Transcribe {
 
     fn shutdown(&mut self, grace: Duration) {
         self.host.debug(format!("stopping after {} s, {grace:?} to do it in", self.started.elapsed().as_secs()));
-        // The stop message first, so the join does not wait out a tick.
-        if let Some((stop, thread)) = self.upkeep.take() {
+        // Everything below ends inside 0.9 x grace, so the recorder never has to kill the process.
+        let t0 = Instant::now();
+        let deadline = t0 + grace.mul_f64(0.9);
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+        // Told to stop now; joined (if it has finished) at the end, never waited on beyond the deadline.
+        let upkeep = self.upkeep.take().map(|(stop, thread)| {
             let _ = stop.send(());
-            let _ = thread.join();
-        }
+            thread
+        });
         // A call in flight at stop gets its answer, and a pressed button its reply.
-        let idle_by = Instant::now() + grace.mul_f64(0.5);
+        let idle_by = (t0 + grace.mul_f64(0.5)).min(deadline);
         while (!self.queue.is_empty() || self.tests.iter().any(|t| !t.is_finished())) && Instant::now() < idle_by {
             thread::sleep(Duration::from_millis(50));
         }
-        self.queue.shutdown(grace / 2);
+        let http_budget = if self.http.is_some() { Duration::from_secs(2).min(grace / 4) } else { Duration::ZERO };
+        self.queue.shutdown(remaining().saturating_sub(http_budget));
         self.report.send();
         if let Some(http) = self.http.take() {
-            http.stop(Duration::from_secs(2).min(grace / 4));
+            http.stop(Duration::from_secs(2).min(remaining()));
+        }
+        if let Some(thread) = upkeep {
+            while !thread.is_finished() && !remaining().is_zero() {
+                thread::sleep(Duration::from_millis(50));
+            }
+            if thread.is_finished() {
+                let _ = thread.join();
+            } // else detached: the process exits around it
         }
     }
 }
@@ -626,7 +639,7 @@ mod tests {
             if r.path == "/v1/models" {
                 return (200, MODELS.into());
             }
-            std::thread::sleep(Duration::from_secs(4));
+            std::thread::sleep(Duration::from_secs(3));
             (200, OK.into())
         });
         let dir = testing::temp_dir("plugin");
@@ -681,6 +694,22 @@ mod tests {
         assert_eq!((m.endpoints[0].name.as_str(), m.endpoints[0].state, m.queued), ("eddie:8766", EndpointState::Down, Some(51)));
         assert_eq!(metrics_of(&failing, "http://e", 0, "m").endpoints[0].state, EndpointState::Degraded);
         assert_eq!(metrics_of(&ok, "http://e", 0, "m").endpoints[0].state, EndpointState::Unknown);
+    }
+
+    #[test]
+    fn shutdown_ends_inside_the_grace_with_a_call_still_in_flight() {
+        // An engine that answers nothing (the models probe included) for longer than the grace.
+        let s = MockServer::start(|_| {
+            std::thread::sleep(Duration::from_secs(15));
+            (200, OK.into())
+        });
+        let dir = testing::temp_dir("plugin");
+        let c = speech_call(&dir, 451);
+        let hello = hello_with(&dir, s.url(), json!({ "engine": { "concurrency": 1 } }));
+        let t0 = Instant::now();
+        let out = testing::run::<Transcribe>([HostMessage::Hello(hello), HostMessage::CallConcluded(c)]);
+        assert!(t0.elapsed() < Duration::from_millis(9500), "took {:?} of a 10 s grace", t0.elapsed());
+        assert!(out.results().is_empty(), "the call in flight had no answer to give");
     }
 
     #[test]
