@@ -1,0 +1,30 @@
+[package]
+name = "transcribe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Transcribes every recorded call with a speech-to-text engine and serves the transcripts."
+license = "MIT"
+repository = "https://github.com/trunk-reporter/trunk-plugin-transcribe"
+publish = false
+
+[dependencies]
+trunk-recorder-plugin = { git = "https://github.com/TrunkRecorder/trunk-recorder-pro", rev = "8870d27d513f54575b59dbae819486b00f5e47e4" }
+schemars = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+hound = "3"
+axum = "0.8"
+tokio = { version = "1", features = ["rt", "sync", "net", "time", "macros"] }
+tower-http = "0.6"
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = "0.5"
+tokio = { version = "1", features = ["io-util"] }
+
+[profile.release]
+strip = true
+lto = true
