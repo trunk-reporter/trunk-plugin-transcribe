@@ -12,6 +12,8 @@ pub use crate::segment::Word;
 #[derive(Clone)]
 pub struct Engine {
     client: reqwest::blocking::Client,
+    /// The longest any request may take, whatever its settings say.
+    ceiling: Duration,
 }
 
 /// The audio to send, with the file name and type the engine sees.
@@ -44,10 +46,26 @@ struct Wire {
     text: String,
     #[serde(default)]
     language: Option<String>,
+    /// Absent, `null` or a list; a word may lack its times.
     #[serde(default)]
-    words: Vec<Word>,
+    words: Option<Vec<WireWord>>,
     #[serde(default)]
     model: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WireWord {
+    #[serde(default)]
+    word: String,
+    #[serde(default)]
+    start: Option<f64>,
+    #[serde(default)]
+    end: Option<f64>,
+}
+
+/// The words with their times; none at all when any lacks one (the text is then one segment).
+fn timed(words: Vec<WireWord>) -> Vec<Word> {
+    words.into_iter().map(|w| Some(Word { word: w.word, start: w.start?, end: w.end? })).collect::<Option<Vec<_>>>().unwrap_or_default()
 }
 
 #[derive(Deserialize)]
@@ -62,9 +80,15 @@ struct ModelEntry {
 }
 
 impl Engine {
+    /// A client whose requests never take longer than `timeout`; each takes at
+    /// most its settings' `timeout_seconds` too, read as it is sent.
     pub fn new(timeout: Duration) -> Engine {
         let client = reqwest::blocking::Client::builder().timeout(timeout).build().expect("an HTTP client");
-        Engine { client }
+        Engine { client, ceiling: timeout }
+    }
+
+    fn timeout(&self, cfg: &EngineConfig) -> Duration {
+        Duration::from_secs(cfg.timeout_seconds).min(self.ceiling)
     }
 
     /// `POST {url}/v1/audio/transcriptions` with `audio`.
@@ -79,22 +103,31 @@ impl Engine {
             form = form.text("prompt", prompt);
         }
         let (body, content_type) = form.finish();
-        let request = self.client.post(route(cfg, "/v1/audio/transcriptions")).header("Content-Type", content_type).body(body);
+        let request = self.client.post(route(cfg, "/v1/audio/transcriptions")).timeout(self.timeout(cfg)).header("Content-Type", content_type).body(body);
         let raw = read(authorize(request, cfg))?;
         let wire: Wire = serde_json::from_str(&raw).map_err(|e| EngineError::Fail(format!("unreadable answer: {e}")))?;
-        Ok(Answer { text: wire.text, language: wire.language, words: wire.words, model: wire.model, raw })
+        Ok(Answer { text: wire.text, language: wire.language, words: timed(wire.words.unwrap_or_default()), model: wire.model, raw })
     }
 
-    /// `GET {url}/v1/models`: the first model's id, or `None` when the engine has no list.
+    /// `GET {url}/v1/models`: the model the engine runs for `cfg.model`, that is
+    /// `cfg.model` when the engine lists it, else the engine's only model;
+    /// `None` when neither (several models, none of them asked for) or no list.
     pub fn models(&self, cfg: &EngineConfig) -> Result<Option<String>, EngineError> {
-        let request = authorize(self.client.get(route(cfg, "/v1/models")), cfg);
+        let request = authorize(self.client.get(route(cfg, "/v1/models")).timeout(self.timeout(cfg)), cfg);
         let raw = match read(request) {
             Ok(raw) => raw,
             Err(EngineError::Fail(m)) if m.starts_with("HTTP 404") => return Ok(None),
             Err(e) => return Err(e),
         };
         let models: Models = serde_json::from_str(&raw).map_err(|e| EngineError::Fail(format!("unreadable answer: {e}")))?;
-        Ok(models.data.into_iter().next().map(|m| m.id))
+        let mut ids: Vec<String> = models.data.into_iter().map(|m| m.id).collect();
+        Ok(if ids.contains(&cfg.model) {
+            Some(cfg.model.clone())
+        } else if ids.len() == 1 {
+            ids.pop()
+        } else {
+            None
+        })
     }
 }
 
@@ -224,11 +257,41 @@ mod tests {
     }
 
     #[test]
-    fn models_names_the_first_or_none() {
-        let s = MockServer::start(|r| {
-            if r.path == "/v1/models" { (200, r#"{"object":"list","data":[{"id":"Qwen3-ASR-1.7B"},{"id":"other"}]}"#.into()) } else { (404, "".into()) }
+    fn the_settings_timeout_is_read_per_request() {
+        let s = MockServer::start(|_| {
+            std::thread::sleep(Duration::from_millis(2500));
+            (200, OK.into())
         });
-        assert_eq!(Engine::new(Duration::from_secs(5)).models(&cfg(s.url())).unwrap(), Some("Qwen3-ASR-1.7B".into()));
+        let engine = Engine::new(Duration::from_secs(30));
+        let t0 = Instant::now();
+        let c = EngineConfig { timeout_seconds: 1, ..cfg(s.url()) };
+        assert!(matches!(engine.transcribe(&c, wav(), "en", "").unwrap_err(), EngineError::Retry(_)));
+        assert!(engine.models(&c).is_err());
+        assert!(t0.elapsed() < Duration::from_millis(4000), "two requests of 1 s took {:?}", t0.elapsed());
+    }
+
+    #[test]
+    fn words_without_times_or_none_at_all_still_read() {
+        let untimed = r#"{"text":"Tower 73","words":[{"word":"Tower","start":0.1,"end":0.4},{"word":"73","start":0.5}]}"#;
+        let null = r#"{"text":"Tower 73","words":null}"#;
+        for body in [untimed, null] {
+            let s = MockServer::start(move |_| (200, body.into()));
+            let a = Engine::new(Duration::from_secs(5)).transcribe(&cfg(s.url()), wav(), "en", "").unwrap();
+            assert_eq!((a.text.as_str(), a.words.len()), ("Tower 73", 0), "{body}");
+        }
+    }
+
+    #[test]
+    fn models_names_the_asked_or_the_only_one() {
+        let models = |body: &'static str, model: &str| {
+            let s = MockServer::start(move |r| if r.path == "/v1/models" { (200, body.into()) } else { (404, "".into()) });
+            Engine::new(Duration::from_secs(5)).models(&EngineConfig { model: model.into(), ..cfg(s.url()) }).unwrap()
+        };
+        let two = r#"{"object":"list","data":[{"id":"Qwen3-ASR-1.7B"},{"id":"whisper-large-v3"}]}"#;
+        assert_eq!(models(two, "whisper-large-v3"), Some("whisper-large-v3".into()), "the one asked for");
+        assert_eq!(models(two, "default"), None, "several, none asked for");
+        let one = r#"{"object":"list","data":[{"id":"Qwen3-ASR-1.7B"}]}"#;
+        assert_eq!(models(one, "default"), Some("Qwen3-ASR-1.7B".into()), "the only one");
         let s = MockServer::start(|_| (404, "".into()));
         assert_eq!(Engine::new(Duration::from_secs(5)).models(&cfg(s.url())).unwrap(), None);
         let s = MockServer::start(|_| (200, r#"{"object":"list"}"#.into()));

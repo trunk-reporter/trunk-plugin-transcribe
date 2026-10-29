@@ -33,6 +33,7 @@ CREATE TABLE segments (
 ) WITHOUT ROWID;
 CREATE INDEX transcripts_start ON transcripts(start_ms);
 CREATE INDEX transcripts_tg_start ON transcripts(short_name, talkgroup, start_ms);
+CREATE INDEX transcripts_transcribed ON transcripts(transcribed_ms);
 CREATE VIRTUAL TABLE transcripts_fts USING fts5(text, content='transcripts', content_rowid='rowid');
 CREATE TRIGGER transcripts_ai AFTER INSERT ON transcripts BEGIN
   INSERT INTO transcripts_fts(rowid, text) VALUES (new.rowid, new.text);
@@ -559,14 +560,15 @@ impl Store {
         with_segments(&conn, rows)
     }
 
-    /// Paths whose text came from a model other than `model` (or an unknown
-    /// one), oldest first; failed and skipped calls have nothing to redo.
+    /// Paths whose text came from a model other than `model` (the one the
+    /// engine named, else the one asked for), oldest first; failed and
+    /// skipped calls have nothing to redo.
     pub fn retranscribe_candidates(&self, model: &str, since_ms: Option<i64>) -> Result<Vec<String>, String> {
         let conn = self.conn()?;
         let mut st = conn
             .prepare(
                 "SELECT path FROM transcripts WHERE status IN ('ok','empty','rejected') \
-                 AND (model_reported IS NULL OR model_reported <> ?1) AND (?2 IS NULL OR start_ms >= ?2) \
+                 AND COALESCE(model_reported, model_asked) <> ?1 AND (?2 IS NULL OR start_ms >= ?2) \
                  ORDER BY start_ms, path",
             )
             .map_err(err)?;
@@ -586,16 +588,19 @@ pub fn fts_query(q: &str) -> String {
 
 impl Store {
     /// Deletes transcripts older than `days` days before `now_ms` (0 days keeps everything);
-    /// returns how many went.
+    /// returns how many went. The lock is taken per batch of 500, so the pipeline
+    /// and the HTTP side are not held up for the whole sweep.
     pub fn retain(&self, days: u32, now_ms: i64) -> Result<usize, String> {
         if days == 0 {
             return Ok(0);
         }
         let cutoff = now_ms - i64::from(days) * 86_400_000;
-        let conn = self.conn()?;
         let mut total = 0;
         loop {
-            let n = conn.execute("DELETE FROM transcripts WHERE path IN (SELECT path FROM transcripts WHERE start_ms < ? LIMIT 500)", [cutoff]).map_err(err)?;
+            let n = self
+                .conn()?
+                .execute("DELETE FROM transcripts WHERE path IN (SELECT path FROM transcripts WHERE start_ms < ? LIMIT 500)", [cutoff])
+                .map_err(err)?;
             total += n;
             if n < 500 {
                 return Ok(total);
@@ -703,6 +708,20 @@ mod tests {
         assert_eq!(s.retain(0, 1_000_000).unwrap(), 0);
         assert_eq!(s.retain(1, 2500 + 86_400_000).unwrap(), 2);
         assert!(s.get("a").unwrap().is_none() && s.get("c").unwrap().is_some());
+
+        // No reported model: the one asked for is the transcript's model.
+        s.put(&Row { model_reported: None, model_asked: "big".into(), ..row("e", 5000, Status::Ok, Some("t")) }, &[]).unwrap();
+        assert!(s.retranscribe_candidates("big", None).unwrap().is_empty());
+        assert_eq!(s.retranscribe_candidates("m2", None).unwrap(), ["e"]);
+    }
+
+    #[test]
+    fn transcribed_ms_is_indexed() {
+        let s = Store::in_memory();
+        let conn = s.0.lock().unwrap();
+        let plan: String =
+            conn.query_row("EXPLAIN QUERY PLAN SELECT COUNT(*) FROM transcripts WHERE status = 'ok' AND transcribed_ms >= 0", [], |r| r.get(3)).unwrap();
+        assert!(plan.contains("transcripts_transcribed"), "{plan}");
     }
 
     #[test]

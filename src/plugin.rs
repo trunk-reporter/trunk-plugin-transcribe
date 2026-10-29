@@ -4,7 +4,7 @@
 //! leaving a live call unanswered.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::thread::{self, JoinHandle};
@@ -36,6 +36,8 @@ const RETAIN_EVERY: Duration = Duration::from_secs(86_400);
 const DOWN_IS_ERROR: Duration = Duration::from_secs(300);
 const RETRY_AFTER: [Duration; 3] = [Duration::from_secs(2), Duration::from_secs(8), Duration::from_secs(30)];
 const MAX_AGE: Duration = Duration::from_secs(50 * 60);
+/// The longest `engine.timeoutSeconds` allows.
+const MAX_ENGINE_TIMEOUT: Duration = Duration::from_secs(600);
 const DAY_MS: i64 = 86_400_000;
 const RESTART_WARNING: &str = "Concurrency, Queue size and HTTP settings take effect when recording next starts";
 
@@ -120,7 +122,8 @@ impl Plugin for Transcribe {
             config: Arc::new(RwLock::new(config.clone())),
             systems: Arc::new(RwLock::new(systems_of(&setup))),
             store: store.clone(),
-            engine: Engine::new(Duration::from_secs(config.engine.timeout_seconds)),
+            // Each request takes the settings' timeout as it is then; this is only the most it may be.
+            engine: Engine::new(MAX_ENGINE_TIMEOUT),
             reported_model: Arc::new(RwLock::new(None)),
             announce: tokio::sync::broadcast::channel(256).0,
             capture_dir: setup.capture_dir.clone(),
@@ -157,8 +160,15 @@ impl Plugin for Transcribe {
         };
 
         let started = Instant::now();
-        let report =
-            Arc::new(Report { host: host.clone(), ctx: ctx.clone(), queue: queue.clone(), queue_max: config.queue.max, health, refused: Mutex::new(None) });
+        let report = Arc::new(Report {
+            host: host.clone(),
+            ctx: ctx.clone(),
+            queue: queue.clone(),
+            queue_max: config.queue.max,
+            health,
+            refused: Mutex::new(None),
+            reprobe: AtomicBool::new(false),
+        });
         let upkeep = {
             let mut upkeep = Upkeep {
                 report: report.clone(),
@@ -231,6 +241,15 @@ impl Plugin for Transcribe {
             return Err(e);
         }
         let restart = self.running.differs(&setup.config);
+        let engine_changed = {
+            let now = &read(&self.ctx.config).engine;
+            now.url != setup.config.engine.url || now.model != setup.config.engine.model
+        };
+        if engine_changed {
+            // What the old engine named is not what answers now: asked again on the next tick.
+            *write(&self.ctx.reported_model) = None;
+            self.report.reprobe.store(true, Ordering::Relaxed);
+        }
         self.days.store(setup.config.archive.days, Ordering::Relaxed);
         *write(&self.ctx.systems) = systems_of(&setup);
         *write(&self.ctx.config) = setup.config;
@@ -316,6 +335,8 @@ struct Report {
     health: Arc<RwLock<Health>>,
     /// Why the last settings were refused: the status until good ones come.
     refused: Mutex<Option<String>>,
+    /// The engine or its model changed: the models probe runs on the next tick.
+    reprobe: AtomicBool,
 }
 
 impl Report {
@@ -425,11 +446,15 @@ impl Upkeep {
     fn tick(&mut self, now: Instant) {
         let ctx = &self.report.ctx;
         let host = &self.report.host;
-        if now >= self.next_models {
+        if self.report.reprobe.swap(false, Ordering::Relaxed) || now >= self.next_models {
             self.next_models = now + MODELS_EVERY;
             let engine = read(&ctx.config).engine.clone();
-            // An error leaves the model the engine last named.
-            if let Ok(model) = self.probe.models(&engine) {
+            // An error leaves the model the engine last named; an answer about an engine since replaced is dropped.
+            let probed = self.probe.models(&engine).ok().filter(|_| {
+                let current = &read(&ctx.config).engine;
+                current.url == engine.url && current.model == engine.model
+            });
+            if let Some(model) = probed {
                 let changed = {
                     let mut cached = write(&ctx.reported_model);
                     let changed = *cached != model;
@@ -476,7 +501,7 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, Instant};
     use trunk_recorder_plugin::testing::{self, MockServer};
-    use trunk_recorder_plugin::{Action, CallsPage, EndpointState, Hello, HostMessage, Level, Outcome, PluginMessage, State, StoredCall};
+    use trunk_recorder_plugin::{Action, CallsPage, EndpointState, Hello, HostInfo, HostMessage, Level, Outcome, PluginMessage, State, StoredCall};
 
     const OK: &str = r#"{"task":"transcribe","language":"en","text":"Tower 73 go ahead","model":"Qwen3-ASR-1.7B","words":[{"word":"Tower","start":0.1,"end":0.4},{"word":"73","start":0.5,"end":0.9}]}"#;
     const MODELS: &str = r#"{"object":"list","data":[{"id":"Qwen3-ASR-1.7B"}]}"#;
@@ -664,6 +689,36 @@ mod tests {
                 (calls[1].path.clone(), Outcome::Ok, String::new()),
             ]
         );
+    }
+
+    #[test]
+    fn a_new_engine_or_model_forgets_the_reported_model() {
+        let s = engine();
+        let dir = testing::temp_dir("plugin");
+        let setup = |model: &str| Setup::<Config, SystemConfig> {
+            config: serde_json::from_value(json!({ "engine": { "url": s.url(), "model": model } })).unwrap(),
+            systems: Vec::new(),
+            host: HostInfo::default(),
+            capture_dir: dir.join("capture"),
+            data_dir: dir.join("data"),
+            audio_formats: vec!["wav".into()],
+        };
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        let (host, _out) = testing::capture();
+        let mut plugin = Transcribe::start(host, setup("default")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while read(&plugin.ctx.reported_model).is_none() {
+            assert!(Instant::now() < deadline, "the start probe never named the model");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(read(&plugin.ctx.reported_model).as_deref(), Some("Qwen3-ASR-1.7B"));
+
+        plugin.settings(setup("default")).unwrap();
+        assert!(read(&plugin.ctx.reported_model).is_some(), "the same engine and model: kept");
+        plugin.settings(setup("Qwen3-ASR-1.7B")).unwrap();
+        assert_eq!(*read(&plugin.ctx.reported_model), None, "a new model: forgotten");
+        assert!(plugin.report.reprobe.load(Ordering::Relaxed), "and asked again on the next tick");
+        plugin.shutdown(Duration::from_secs(1));
     }
 
     #[test]

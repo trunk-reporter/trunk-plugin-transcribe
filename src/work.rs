@@ -538,6 +538,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_answer_with_untimed_words_is_an_ok_row_with_its_text() {
+        let dir = testing::temp_dir("work");
+        let untimed = r#"{"text":"Tower 73 go ahead","words":[{"word":"Tower","start":0.1,"end":0.4},{"word":"73","start":0.5}]}"#;
+        let null = r#"{"text":"Tower 73 go ahead","words":null}"#;
+        for (tg, body) in [(14, untimed), (15, null)] {
+            let s = MockServer::start(move |_| (200, body.into()));
+            let ctx = ctx(s.url());
+            let c = speech_call(&dir, tg);
+            assert!(matches!(process(&ctx, &job(c.clone()), &|_| {}), Done::Ok { .. }), "{body}");
+            let (row, segs) = ctx.store.get(&c.path).unwrap().unwrap();
+            assert_eq!((row.status, row.text.as_deref()), (Status::Ok, Some("Tower 73 go ahead")), "{body}");
+            assert_eq!((segs.len(), segs[0].text.as_str(), segs[0].end_s), (1, "Tower 73 go ahead", 3.0), "the whole text, one segment");
+        }
+    }
+
+    #[test]
     fn systems_of_takes_each_systems_name_switch_and_settings() {
         let mut own = Config::default();
         own.engine.model = "big".into();

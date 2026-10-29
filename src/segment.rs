@@ -3,7 +3,7 @@
 use trunk_recorder_plugin::SrcEntry;
 
 /// One word with its time in the audio, as the engine reports it.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Word {
     pub word: String,
     pub start: f64,

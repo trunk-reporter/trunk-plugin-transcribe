@@ -16,13 +16,20 @@ fn normalise(token: &str) -> String {
     token.trim_matches(|c: char| c.is_ascii_punctuation()).to_lowercase()
 }
 
+/// The normalised words of `text`: a token with no letter or digit is no word.
+fn words(text: &str) -> Vec<String> {
+    text.split_whitespace().filter(|t| t.chars().any(char::is_alphanumeric)).map(normalise).filter(|t| !t.is_empty()).collect()
+}
+
 /// Filter `text`, which was spoken over `length_s` seconds.
 ///
-/// Words are whitespace tokens. The rate check is skipped when `length_s <= 0`.
+/// Words are whitespace tokens with a letter or digit in them; text without
+/// any is empty. The rate check is skipped when `length_s <= 0`.
 /// Repetition is the same normalised token more than `max_repeat` times in a
-/// row. A hallucination is the whole normalised text equal to a list entry.
+/// row. A hallucination is the whole normalised text equal to a list entry
+/// (an entry with no words matches nothing).
 pub fn check(text: &str, length_s: f64, cfg: &FilterConfig) -> Verdict {
-    let tokens: Vec<String> = text.split_whitespace().map(normalise).collect();
+    let tokens = words(text);
     if tokens.is_empty() {
         return Verdict::Empty;
     }
@@ -40,8 +47,8 @@ pub fn check(text: &str, length_s: f64, cfg: &FilterConfig) -> Verdict {
     }
     let whole = tokens.join(" ");
     let is_known = cfg.hallucinations.iter().any(|h| {
-        let entry: Vec<String> = h.split_whitespace().map(normalise).collect();
-        entry.join(" ") == whole
+        let entry = words(h);
+        !entry.is_empty() && entry.join(" ") == whole
     });
     if is_known {
         return Verdict::Rejected("hallucination");
@@ -67,5 +74,16 @@ mod tests {
         assert_eq!(check("Thank you for watching.", 3.0, &cfg), Verdict::Rejected("hallucination"));
         assert_eq!(check("thank you for watching!", 3.0, &cfg), Verdict::Rejected("hallucination"));
         assert_eq!(check("Thank you for watching the scene", 3.0, &cfg), Verdict::Ok, "only the whole text");
+    }
+
+    #[test]
+    fn punctuation_alone_is_empty() {
+        let cfg = FilterConfig::default();
+        assert_eq!(check("...", 3.0, &cfg), Verdict::Empty);
+        assert_eq!(check("... ... ...", 3.0, &cfg), Verdict::Empty);
+        assert_eq!(check("- … ?!", 3.0, &cfg), Verdict::Empty);
+        assert_eq!(check("Tower ... 73", 3.0, &cfg), Verdict::Ok);
+        let odd = FilterConfig { hallucinations: vec![String::new(), "...".into()], ..FilterConfig::default() };
+        assert_eq!(check("Tower 73", 3.0, &odd), Verdict::Ok, "an entry with no words matches nothing");
     }
 }
