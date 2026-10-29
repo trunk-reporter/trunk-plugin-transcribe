@@ -44,6 +44,8 @@ impl Mode {
 struct Pass {
     request: u64,
     mode: Mode,
+    /// The window's lower bound, asked on every page.
+    from: Option<i64>,
     /// Re-transcribe only: the paths to do again.
     candidates: HashSet<String>,
     queued: u32,
@@ -70,10 +72,11 @@ impl Archive {
         self.pass.is_some()
     }
 
-    /// Starts a pass; false when one is running.
-    pub fn begin(&mut self, mode: Mode, now_ms: i64) -> bool {
+    /// Starts a pass: `Ok(true)` when it started (or had nothing to do), `Ok(false)` when one is
+    /// running, `Err` when the store could not be read.
+    pub fn begin(&mut self, mode: Mode, now_ms: i64) -> Result<bool, String> {
         if self.pass.is_some() {
-            return false;
+            return Ok(false);
         }
         let from = match &mode {
             Mode::Retranscribe { everything: true, .. } => None,
@@ -83,20 +86,22 @@ impl Archive {
         if let Mode::Retranscribe { model, .. } = &mode {
             match self.store.retranscribe_candidates(model, from) {
                 Ok(paths) if paths.is_empty() => {
-                    self.host.info(format!("re-transcribe: nothing to do, every transcript is from {model}"));
-                    return true;
+                    let window = if from.is_some() { format!(" in the last {} days", self.days.load(Ordering::Relaxed)) } else { String::new() };
+                    self.host.info(format!("re-transcribe: nothing to do{window}, every transcript is from {model}"));
+                    return Ok(true);
                 }
                 Ok(paths) => candidates = paths.into_iter().collect(),
                 Err(e) => {
-                    self.host.warn(format!("re-transcribe: the store could not be read: {e}"));
-                    return true;
+                    let message = format!("re-transcribe: the store could not be read: {e}");
+                    self.host.warn(message.clone());
+                    return Err(message);
                 }
             }
         }
         self.host.info(format!("archive pass started ({})", mode.label()));
         let request = self.host.calls(CallsQuery { from, limit: Some(PAGE), ..Default::default() });
-        self.pass = Some(Pass { request, mode, candidates, queued: 0, skipped: 0, pages: 0 });
-        true
+        self.pass = Some(Pass { request, mode, from, candidates, queued: 0, skipped: 0, pages: 0 });
+        Ok(true)
     }
 
     /// Handles a page of the recorder's call store; false when it is not this pass's.
@@ -117,7 +122,7 @@ impl Archive {
         pass.skipped += skipped;
         let stop = pass.mode == Mode::Periodic && queued == 0 && skipped == 0;
         if page.more && !stop {
-            pass.request = self.host.calls(CallsQuery { before: Some(page.before), limit: Some(PAGE), ..Default::default() });
+            pass.request = self.host.calls(CallsQuery { from: pass.from, before: Some(page.before), limit: Some(PAGE), ..Default::default() });
             self.pass = Some(pass);
         } else {
             self.finish(&pass);
@@ -163,12 +168,11 @@ impl Archive {
                 }
             }
             let system = systems.iter().position(|s| s.short_name == e.record.short_name).unwrap_or(0) as u16;
-            let base = self.capture_dir.join(&e.path);
             let call = ConcludedCall {
                 path: e.path.clone(),
                 system,
                 call: e.record.clone(),
-                files: CallFiles { json: base.with_extension("json"), wav: base.with_extension("wav"), m4a: None },
+                files: CallFiles { json: self.capture_dir.join(format!("{}.json", e.path)), wav: self.capture_dir.join(format!("{}.wav", e.path)), m4a: None },
             };
             let kind = if retranscribe { Kind::Retranscribe } else { Kind::Archive };
             if self.queue.push(call, kind) {
@@ -220,6 +224,7 @@ mod tests {
     use trunk_recorder_plugin::{CallRecord, Level, PluginMessage};
 
     type Seen = Arc<std::sync::Mutex<Vec<(Kind, String)>>>;
+    type Files = Arc<std::sync::Mutex<Vec<CallFiles>>>;
 
     struct Fx {
         archive: Archive,
@@ -322,7 +327,7 @@ mod tests {
         f0.put(&row("g", Status::Failed, 10, None), &[]).unwrap();
         let mut f = fixture(f0);
         let now = 100 * DAY_MS;
-        assert!(f.archive.begin(Mode::Start, now));
+        assert!(f.archive.begin(Mode::Start, now).unwrap());
         let q = queries(&f);
         assert_eq!(q.len(), 1);
         assert_eq!((q[0].from, q[0].limit, q[0].before), (Some(now - 7 * DAY_MS), Some(500), None));
@@ -331,7 +336,7 @@ mod tests {
         assert!(f.archive.on_page(page(req, vec![stored("a", true), stored("b", true), stored("f", true), stored("g", true)], true, 500)));
         let q = queries(&f);
         assert_eq!(q.len(), 2);
-        assert_eq!(q[1].before, Some(500));
+        assert_eq!((q[1].before, q[1].from), (Some(500), Some(now - 7 * DAY_MS)));
         assert!(f.archive.running());
 
         assert!(f.archive.on_page(page(q[1].request, vec![stored("c", false), stored("d", true)], false, 0)));
@@ -353,7 +358,7 @@ mod tests {
         s.put(&row("a", Status::Ok, 1, None), &[]).unwrap();
         s.put(&row("b", Status::Empty, 1, None), &[]).unwrap();
         let mut f = fixture(s);
-        assert!(f.archive.begin(Mode::Periodic, DAY_MS * 50));
+        assert!(f.archive.begin(Mode::Periodic, DAY_MS * 50).unwrap());
         let req = queries(&f)[0].request;
         assert!(f.archive.on_page(page(req, vec![stored("a", true), stored("b", true)], true, 500)));
         assert_eq!(queries(&f).len(), 1);
@@ -364,7 +369,7 @@ mod tests {
     #[test]
     fn the_store_being_off_is_logged_once_and_the_pass_ends() {
         let mut f = fixture(Store::in_memory());
-        f.archive.begin(Mode::Start, DAY_MS * 50);
+        f.archive.begin(Mode::Start, DAY_MS * 50).unwrap();
         let req = queries(&f)[0].request;
         let p = CallsPage { request: req, error: Some("the call store is off".into()), ..Default::default() };
         assert!(f.archive.on_page(p));
@@ -372,7 +377,7 @@ mod tests {
         assert_eq!(queries(&f).len(), 1);
         let warns = logs(&f, Level::Warn);
         assert_eq!(warns, ["archive pass: the recorder's call store answered: the call store is off"]);
-        assert!(f.archive.begin(Mode::Start, DAY_MS * 50));
+        assert!(f.archive.begin(Mode::Start, DAY_MS * 50).unwrap());
         assert_eq!(queries(&f).len(), 2);
     }
 
@@ -385,7 +390,7 @@ mod tests {
         s.put(&row("d", Status::Skipped, 1, None), &[]).unwrap();
         let mut f = fixture(s);
         let now = 7 * DAY_MS;
-        assert!(f.archive.begin(Mode::Retranscribe { everything: false, model: "m2".into() }, now));
+        assert!(f.archive.begin(Mode::Retranscribe { everything: false, model: "m2".into() }, now).unwrap());
         let q = queries(&f);
         assert_eq!(q[0].from, Some(now - 7 * DAY_MS));
         assert!(f.archive.on_page(page(q[0].request, vec![stored("a", true), stored("b", true), stored("c", true), stored("d", true)], false, 0)));
@@ -393,7 +398,7 @@ mod tests {
         assert!(logs(&f, Level::Info).contains(&"archive pass started (re-transcribe)".to_string()));
 
         // Everything: no lower bound.
-        assert!(f.archive.begin(Mode::Retranscribe { everything: true, model: "m2".into() }, now));
+        assert!(f.archive.begin(Mode::Retranscribe { everything: true, model: "m2".into() }, now).unwrap());
         let q = queries(&f);
         assert_eq!(q.len(), 2);
         assert_eq!(q[1].from, None);
@@ -408,23 +413,63 @@ mod tests {
         s.put(&row("a", Status::Ok, 1, Some("m1")), &[]).unwrap();
         s.put(&row("c", Status::Empty, 1, Some("m1")), &[]).unwrap();
         let mut f = fixture(s);
-        assert!(f.archive.begin(Mode::Retranscribe { everything: false, model: "m1".into() }, now));
+        assert!(f.archive.begin(Mode::Retranscribe { everything: false, model: "m1".into() }, now).unwrap());
         assert!(queries(&f).is_empty());
         assert!(!f.archive.running());
-        assert!(logs(&f, Level::Info).contains(&"re-transcribe: nothing to do, every transcript is from m1".to_string()));
+        assert!(logs(&f, Level::Info).contains(&"re-transcribe: nothing to do in the last 7 days, every transcript is from m1".to_string()));
+    }
+
+    #[test]
+    fn a_dotted_path_keeps_its_dot_in_the_file_names() {
+        let (host, _out) = testing::capture();
+        let files = Files::default();
+        let w = files.clone();
+        let queue = Arc::new(Queue::start(
+            host.clone(),
+            QueueOptions { workers: 1, max: 10, retry_after: vec![Duration::from_millis(20)], max_age: Duration::from_secs(3000) },
+            move |job| {
+                w.lock().unwrap().push(job.call.files.clone());
+                Done::Ok { took: Duration::ZERO }
+            },
+            |_, _| {},
+        ));
+        let systems = Arc::new(RwLock::new(Vec::new()));
+        let mut archive = Archive::new(host, Store::in_memory(), queue.clone(), systems, Arc::new(AtomicU32::new(7)), PathBuf::from("cap"));
+        assert!(archive.begin(Mode::Start, DAY_MS * 50).unwrap());
+        assert!(archive.on_page(page(1, vec![stored("sys1/851012500.0-call_1", true)], false, 0)));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while files.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "timed out waiting for the worker");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let got = files.lock().unwrap()[0].clone();
+        assert!(got.json.to_string_lossy().ends_with("851012500.0-call_1.json"), "{:?}", got.json);
+        assert!(got.wav.to_string_lossy().ends_with("851012500.0-call_1.wav"), "{:?}", got.wav);
+    }
+
+    #[test]
+    fn begin_reports_a_store_that_cannot_be_read() {
+        let s = Store::in_memory();
+        s.0.lock().unwrap().execute_batch("DROP TABLE transcripts").unwrap();
+        let mut f = fixture(s);
+        let r = f.archive.begin(Mode::Retranscribe { everything: false, model: "m1".into() }, DAY_MS * 50);
+        assert!(r.is_err(), "{r:?}");
+        assert!(!f.archive.running());
+        assert!(queries(&f).is_empty());
+        assert_eq!(logs(&f, Level::Warn).len(), 1);
     }
 
     #[test]
     fn a_second_begin_while_running_is_refused() {
         let mut f = fixture(Store::in_memory());
-        assert!(f.archive.begin(Mode::Start, DAY_MS * 50));
-        assert!(!f.archive.begin(Mode::Periodic, DAY_MS * 50));
+        assert!(f.archive.begin(Mode::Start, DAY_MS * 50).unwrap());
+        assert!(!f.archive.begin(Mode::Periodic, DAY_MS * 50).unwrap());
         assert_eq!(queries(&f).len(), 1);
         // A page for another request is ignored.
         assert!(!f.archive.on_page(page(999, vec![stored("x", true)], false, 0)));
         assert!(f.archive.running());
         let req = queries(&f)[0].request;
         assert!(f.archive.on_page(page(req, vec![], false, 0)));
-        assert!(f.archive.begin(Mode::Start, DAY_MS * 50));
+        assert!(f.archive.begin(Mode::Start, DAY_MS * 50).unwrap());
     }
 }
