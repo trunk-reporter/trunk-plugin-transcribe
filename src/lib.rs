@@ -8,3 +8,4 @@ pub mod gate;
 pub mod plugin;
 pub mod prompt;
 pub mod segment;
+pub mod store;
