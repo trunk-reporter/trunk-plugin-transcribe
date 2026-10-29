@@ -10,3 +10,4 @@ pub mod prompt;
 pub mod queue;
 pub mod segment;
 pub mod store;
+pub mod work;

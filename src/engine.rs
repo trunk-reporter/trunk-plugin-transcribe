@@ -9,6 +9,7 @@ use crate::config::EngineConfig;
 pub use crate::segment::Word;
 
 /// A blocking client for an OpenAI-style speech-to-text engine.
+#[derive(Clone)]
 pub struct Engine {
     client: reqwest::blocking::Client,
 }
