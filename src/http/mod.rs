@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::routing::get;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::{broadcast, oneshot, watch};
 
 use crate::store::{Store, Transcript};
 
@@ -55,15 +55,18 @@ pub fn router(state: AppState) -> Router {
 
 /// A running server.
 pub struct ServerHandle {
+    /// Ends the open event streams, which graceful shutdown would otherwise wait on forever.
+    shutdown: watch::Sender<bool>,
     stop: oneshot::Sender<()>,
     done: mpsc::Receiver<()>,
     thread: JoinHandle<()>,
 }
 
 impl ServerHandle {
-    /// Stops taking connections and lets open ones finish for up to `within`;
-    /// one still open then (an event stream) is left to the process's exit.
+    /// Ends the event streams, stops taking connections and lets open requests
+    /// finish for up to `within`; one still open then is left to the process's exit.
     pub fn stop(self, within: Duration) {
+        let _ = self.shutdown.send(true);
         let _ = self.stop.send(());
         if self.done.recv_timeout(within).is_ok() {
             let _ = self.thread.join();
@@ -81,7 +84,8 @@ pub fn start(state: AppState, bind: &str, port: u16) -> Result<(ServerHandle, So
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| format!("cannot start the HTTP server: {e}"))?;
     let (stop, stopped) = oneshot::channel::<()>();
     let (done_tx, done) = mpsc::channel();
-    let app = router(state);
+    let (shutdown, shutdown_rx) = watch::channel(false);
+    let app = router(state).layer(axum::Extension(shutdown_rx));
     let thread = std::thread::Builder::new()
         .name("http".into())
         .spawn(move || {
@@ -98,7 +102,7 @@ pub fn start(state: AppState, bind: &str, port: u16) -> Result<(ServerHandle, So
             let _ = done_tx.send(());
         })
         .map_err(|e| format!("cannot start the HTTP server: {e}"))?;
-    Ok((ServerHandle { stop, done, thread }, addr))
+    Ok((ServerHandle { shutdown, stop, done, thread }, addr))
 }
 
 #[cfg(test)]
