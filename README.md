@@ -75,16 +75,21 @@ When a call concludes, the plugin:
 4. Filters the answer: too many words per second, a word repeated too often, or a known hallucination is rejected.
 5. Stores the transcript and announces it on `/api/v1/events`.
 
-The engine's model name is asked from `GET /v1/models` and stored on each transcript.
+The engine's model is asked from `GET /v1/models` (the one named by `engine.model` when the engine lists it, else the
+engine's only model) and stored on each transcript; changing `engine.url` or `engine.model` asks again.
 
 ## The archive pass and re-transcribing
 
 When the plugin starts, and then every `archive.everyMinutes`, it checks the last `archive.days` days of the recorder's
-call store and queues every call that has no transcript. Archive work never delays live calls.
+call store and queues every call that has no transcript. Archive work never delays live calls. A pass queues at most
+half of `queue.max`; past that it pauses, and the next pass goes on with the rest. A pass whose page does not come from
+the recorder within 60 seconds ends with a warning.
 
 After you change the engine's model, press **Re-transcribe with the current model**. It queues the transcripts with status
-`ok`, `empty` or `rejected` whose recorded model differs from the engine's current model (a transcript with no recorded
-model counts as different). Failed and skipped calls are never selected. Only calls within the last `archive.days` days
+`ok`, `empty` or `rejected` whose recorded model differs from the engine's current model (the one named by
+`engine.model` when the engine lists it, else the engine's only model, else the configured name). A transcript with no
+model reported by the engine counts as made by the model it asked for. Failed and skipped calls are never selected, and
+a re-transcribe that fails or is skipped leaves the old transcript as it was (the log says so). Only calls within the last `archive.days` days
 are considered; tick `archive.retranscribeEverything` to drop that window. The box is read only by the button, not by the
 periodic pass.
 
@@ -98,10 +103,10 @@ Each call has one transcript record, with a `status` and sometimes a `reason`:
 | `skipped` | Not sent. Reason: `encrypted`, `too short`, `silent`, `system disabled` or `no audio`. |
 | `empty` | The engine returned no words. |
 | `rejected` | Thrown out by a filter; the raw answer is kept, the text is not. Reason: `implausible rate`, `repetition` or `hallucination`. |
-| `failed` | Not transcribed. Reason: the engine's error, `gave up: ...`, `engine down`, `queue full` or `shutting down`. The archive pass retries it, up to 10 attempts. |
+| `failed` | Not transcribed. Reason: the engine's error, `gave up: ...`, `engine down`, `queue full` or `shutting down`. The archive pass retries it, up to 10 attempts. A call the archive pass queued but that was never tried gets no record and counts no attempt. |
 
 On the recorder's plugin page the plugin shows **Ok** with the model name; **Warning** when the engine is degraded or the
-queue is half full; and **Error** once the engine has been down for 5 minutes.
+queue is half full of live calls and retries (archive work queuing up is expected); and **Error** once the engine has been down for 5 minutes.
 
 ## HTTP API
 
@@ -159,7 +164,7 @@ cargo build --release
 cargo test
 ```
 
-Needs Rust 1.85 or later.
+Needs Rust 1.89 or later.
 
 ## License
 
