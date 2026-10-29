@@ -11,7 +11,7 @@ use crate::audio::{self, Pcm};
 use crate::config::{Config, SystemConfig};
 use crate::engine::{self, Answer, Engine, EngineError};
 use crate::filter::{self, Verdict};
-use crate::queue::{Done, Job};
+use crate::queue::{Done, Job, Kind};
 use crate::store::{Row, SegmentRow, Status, Store, Transcript};
 use crate::{gate, prompt, segment};
 
@@ -109,11 +109,20 @@ fn write(ctx: &Ctx, row: &Row, segments: &[SegmentRow]) -> Result<(), String> {
     Ok(())
 }
 
-/// A `skipped` row, and `Done::Skipped`.
-fn skip(ctx: &Ctx, job: &Job, settings: &Config, reason: &str) -> Done {
+/// What a re-transcribe that did not come to a transcript logs: it writes nothing.
+fn kept(path: &str, reason: &str) -> String {
+    format!("re-transcribe of {path} failed: {reason}, the old transcript stays")
+}
+
+/// A `skipped` row, and `Done::Skipped`; for a re-transcribe, no row (the old one stays) and a warning.
+fn skip(ctx: &Ctx, job: &Job, settings: &Config, reason: &str, warn: &dyn Fn(String)) -> Done {
+    if job.kind == Kind::Retranscribe {
+        warn(kept(&job.call.path, reason));
+        return Done::Skipped(reason.to_string());
+    }
     match write(ctx, &row_for(job, settings, Status::Skipped, Some(reason.to_string())), &[]) {
         Ok(()) => Done::Skipped(reason.to_string()),
-        Err(e) => Done::Failed(e),
+        Err(e) => Done::Local(e),
     }
 }
 
@@ -168,7 +177,7 @@ fn prepare(loaded: Loaded, settings: &Config) -> Result<Upload, String> {
 }
 
 /// Runs one job through the pipeline. `warn` hears of a rejected transcript
-/// (its path and reason, never its text).
+/// (its path and reason, never its text) and of a re-transcribe skipped.
 pub fn process(ctx: &Ctx, job: &Job, warn: &dyn Fn(String)) -> Done {
     let record = &job.call.call;
 
@@ -176,19 +185,19 @@ pub fn process(ctx: &Ctx, job: &Job, warn: &dyn Fn(String)) -> Done {
     let system = system_of(ctx, &record.short_name);
     let settings = &system.settings;
     if !system.enabled {
-        return skip(ctx, job, settings, "system disabled");
+        return skip(ctx, job, settings, "system disabled", warn);
     }
 
     // 2. The audio.
     let Some(source) = find_audio(ctx, job) else {
-        return skip(ctx, job, settings, "no audio");
+        return skip(ctx, job, settings, "no audio", warn);
     };
 
     // 3. The gate.
     let loaded = match source {
         Source::Wav(path) => match audio::read_wav(&path) {
             Ok(pcm) => Loaded::Wav(pcm),
-            Err(e) => return Done::Failed(format!("unreadable audio: {e}")),
+            Err(e) => return Done::Local(format!("unreadable audio: {e}")),
         },
         Source::M4a(path) => Loaded::M4a(path),
     };
@@ -197,13 +206,13 @@ pub fn process(ctx: &Ctx, job: &Job, warn: &dyn Fn(String)) -> Done {
         Loaded::M4a(_) => None,
     };
     if let Some(reason) = gate::check(record, pcm, &settings.gate) {
-        return skip(ctx, job, settings, reason);
+        return skip(ctx, job, settings, reason, warn);
     }
 
     // 4. Prepare.
     let upload = match prepare(loaded, settings) {
         Ok(upload) => upload,
-        Err(e) => return Done::Failed(e),
+        Err(e) => return Done::Local(e),
     };
 
     // 5. The prompt.
@@ -247,7 +256,7 @@ pub fn process(ctx: &Ctx, job: &Job, warn: &dyn Fn(String)) -> Done {
 
     // 10. Store and announce.
     if let Err(e) = write(ctx, &row, &segments) {
-        return Done::Failed(e);
+        return Done::Local(e);
     }
     if status == Status::Ok {
         ctx.transcribed.fetch_add(1, Ordering::Relaxed);
@@ -264,7 +273,14 @@ fn segments_of(answer: &Answer, src_list: &[SrcEntry], length_s: f64) -> Vec<Seg
 }
 
 /// A `failed` row for a job that gave up, counting the attempts of earlier passes; then announced.
-pub fn record_failed(ctx: &Ctx, job: &Job, reason: &str) {
+/// `ran`: the job was tried. A re-transcribe writes nothing (the old transcript stays) and
+/// `warn` hears of it; an archive call never tried writes nothing, left to a later pass.
+pub fn record_failed(ctx: &Ctx, job: &Job, reason: &str, ran: bool, warn: &dyn Fn(String)) {
+    match job.kind {
+        Kind::Retranscribe => return warn(kept(&job.call.path, reason)),
+        Kind::Archive if !ran => return,
+        _ => {}
+    }
     let system = system_of(ctx, &job.call.call.short_name);
     let mut row = row_for(job, &system.settings, Status::Failed, Some(reason.to_string()));
     if let Ok(Some((before, _))) = ctx.store.get(&job.call.path) {
@@ -278,7 +294,6 @@ pub fn record_failed(ctx: &Ctx, job: &Job, reason: &str) {
 pub(crate) mod tests {
     use super::*;
     use crate::audio::{read_wav, sine, write_temp};
-    use crate::queue::Kind;
     use crate::store::Status;
     use std::cell::RefCell;
     use std::path::Path;
@@ -441,17 +456,77 @@ pub(crate) mod tests {
         assert!(matches!(process(&ctx, &job(c.clone()), &|_| {}), Done::Retry(_)));
         assert!(ctx.store.get(&c.path).unwrap().is_none());
         let mut rx = ctx.announce.subscribe();
-        record_failed(&ctx, &Job { tries: 3, ..job(c.clone()) }, "gave up: 503");
+        record_failed(&ctx, &Job { tries: 3, ..job(c.clone()) }, "gave up: 503", true, &|_| {});
         let (row, _) = ctx.store.get(&c.path).unwrap().unwrap();
         assert_eq!((row.status, row.reason.as_deref(), row.attempts), (Status::Failed, Some("gave up: 503"), 4));
         assert_eq!(rx.try_recv().unwrap().status, "failed");
-        record_failed(&ctx, &job(c.clone()), "again");
+        record_failed(&ctx, &job(c.clone()), "again", false, &|_| {});
         assert_eq!(ctx.store.get(&c.path).unwrap().unwrap().0.attempts, 5, "attempts accumulate across passes");
 
         let s = MockServer::start(|_| (400, "bad".into()));
         let ctx = self::ctx(s.url());
         assert!(matches!(process(&ctx, &job(c.clone()), &|_| {}), Done::Failed(_)));
         assert!(ctx.store.get(&c.path).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_retranscribe_never_takes_a_good_transcript_away() {
+        let good = MockServer::start(|_| (200, OK.into()));
+        let ctx = ctx(good.url());
+        let dir = testing::temp_dir("work");
+        let c = speech_call(&dir, 11);
+        assert!(matches!(process(&ctx, &job(c.clone()), &|_| {}), Done::Ok { .. }));
+        let before = ctx.store.get(&c.path).unwrap().unwrap();
+        assert_eq!((before.0.status, before.1.len()), (Status::Ok, 1));
+        let again = Job { kind: Kind::Retranscribe, ..job(c.clone()) };
+        let warned = RefCell::new(Vec::new());
+        let warn = |m: String| warned.borrow_mut().push(m);
+        let mut rx = ctx.announce.subscribe();
+
+        // The engine fails it: the queue's failed callback writes nothing.
+        let bad = MockServer::start(|_| (400, "bad".into()));
+        ctx.systems.write().unwrap()[0].settings.engine.url = bad.url().into();
+        let Done::Failed(m) = process(&ctx, &again, &warn) else { panic!("an HTTP 400 fails") };
+        record_failed(&ctx, &again, &m, true, &warn);
+        record_failed(&ctx, &Job { tries: 3, ..again.clone() }, "gave up: HTTP 503", true, &warn);
+        record_failed(&ctx, &again, "queue full", false, &warn);
+        record_failed(&ctx, &again, "shutting down", false, &warn);
+        // Skipped on its way: no row either.
+        ctx.systems.write().unwrap()[0].enabled = false;
+        assert!(matches!(process(&ctx, &again, &warn), Done::Skipped(m) if m == "system disabled"));
+        ctx.systems.write().unwrap()[0].enabled = true;
+        let mut gone = again.clone();
+        gone.call.files.wav = dir.join("nowhere.wav");
+        assert!(matches!(process(&ctx, &gone, &warn), Done::Skipped(m) if m == "no audio"));
+
+        assert_eq!(ctx.store.get(&c.path).unwrap().unwrap(), before, "text, segments and all untouched");
+        assert!(rx.try_recv().is_err(), "nothing announced");
+        let warned = warned.into_inner();
+        assert_eq!(warned.len(), 6, "{warned:?}");
+        assert_eq!(warned[2], format!("re-transcribe of {} failed: queue full, the old transcript stays", c.path));
+    }
+
+    #[test]
+    fn an_archive_call_never_tried_leaves_no_row() {
+        let ctx = ctx("http://127.0.0.1:1");
+        let dir = testing::temp_dir("work");
+        let c = speech_call(&dir, 12);
+        let archived = Job { kind: Kind::Archive, ..job(c.clone()) };
+        record_failed(&ctx, &archived, "queue full", false, &|_| {});
+        record_failed(&ctx, &archived, "shutting down", false, &|_| {});
+        assert!(ctx.store.get(&c.path).unwrap().is_none(), "no row, no attempt counted");
+        record_failed(&ctx, &archived, "gave up: HTTP 503", true, &|_| {});
+        let row = ctx.store.get(&c.path).unwrap().unwrap().0;
+        assert_eq!((row.status, row.attempts), (Status::Failed, 1));
+    }
+
+    #[test]
+    fn unreadable_audio_is_a_local_failure() {
+        let ctx = ctx("http://127.0.0.1:1");
+        let dir = testing::temp_dir("work");
+        let c = speech_call(&dir, 13);
+        std::fs::write(&c.files.wav, b"not a wav").unwrap();
+        assert!(matches!(process(&ctx, &job(c), &|_| {}), Done::Local(m) if m.starts_with("unreadable audio")));
     }
 
     #[test]

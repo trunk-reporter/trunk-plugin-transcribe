@@ -128,13 +128,13 @@ impl Plugin for Transcribe {
         };
 
         let queue = {
-            let (work_ctx, work_host, failed_ctx) = (ctx.clone(), host.clone(), ctx.clone());
+            let (work_ctx, work_host, failed_ctx, failed_host) = (ctx.clone(), host.clone(), ctx.clone(), host.clone());
             let opts = QueueOptions { workers: config.engine.concurrency, max: config.queue.max, retry_after: RETRY_AFTER.to_vec(), max_age: MAX_AGE };
             Arc::new(Queue::start(
                 host.clone(),
                 opts,
                 move |job| process(&work_ctx, job, &|m| work_host.warn(m)),
-                move |job, reason| record_failed(&failed_ctx, job, reason),
+                move |job, reason, ran| record_failed(&failed_ctx, job, reason, ran, &|m| failed_host.warn(m)),
             ))
         };
         let days = Arc::new(AtomicU32::new(config.archive.days));
@@ -259,6 +259,8 @@ impl Plugin for Transcribe {
         }
         let http_budget = if self.http.is_some() { Duration::from_secs(2).min(grace / 4) } else { Duration::ZERO };
         self.queue.shutdown(remaining().saturating_sub(http_budget));
+        // A live call still in flight gets its answer now; should it finish later, it sends no second one.
+        self.queue.answer_in_flight("shutting down");
         self.report.send();
         if let Some(http) = self.http.take() {
             http.stop(Duration::from_secs(2).min(remaining()));
@@ -366,6 +368,7 @@ fn metrics_of(snap: &Snapshot, url: &str, transcribed: u64, model: &str) -> Metr
     let extra = BTreeMap::from([
         ("transcribed".to_string(), json!(transcribed)),
         ("archive_queued".to_string(), json!(snap.archive)),
+        ("failures".to_string(), json!(snap.failed)),
         ("model".to_string(), json!(model)),
     ]);
     Metrics {
@@ -384,7 +387,8 @@ fn metrics_of(snap: &Snapshot, url: &str, transcribed: u64, model: &str) -> Metr
 }
 
 /// The status: refused settings, then the engine down for 5 minutes, a queue
-/// over half full, an engine failing, else the model.
+/// over half full of live calls and retries (archive work is meant to queue
+/// up), an engine failing, else the model.
 fn status_of(refused: Option<&str>, snap: &Snapshot, queue_max: usize, model: &str, now: Instant) -> (State, String) {
     if let Some(m) = refused {
         return (State::Error, m.to_string());
@@ -395,8 +399,9 @@ fn status_of(refused: Option<&str>, snap: &Snapshot, queue_max: usize, model: &s
             return (State::Error, format!("engine down since {} min: {}", down.as_secs() / 60, snap.last_error));
         }
     }
-    if snap.queued > queue_max / 2 {
-        (State::Warning, format!("{} calls queued", snap.queued))
+    let waiting = snap.live + snap.retrying;
+    if waiting > queue_max / 2 {
+        (State::Warning, format!("{waiting} calls queued"))
     } else if snap.in_a_row > 0 {
         (State::Warning, format!("engine degraded: {}", snap.last_error))
     } else {
@@ -415,8 +420,8 @@ struct Upkeep {
 }
 
 impl Upkeep {
-    /// One beat: the model probe, the periodic pass and the retention sweep
-    /// when due, then metrics, status and health.
+    /// One beat: the model probe, the archive pass's page timeout, the
+    /// periodic pass and the retention sweep when due, then metrics, status and health.
     fn tick(&mut self, now: Instant) {
         let ctx = &self.report.ctx;
         let host = &self.report.host;
@@ -436,6 +441,7 @@ impl Upkeep {
                 }
             }
         }
+        lock(&self.archive).check_timeout(now);
         let (every_minutes, retention_days) = {
             let c = read(&ctx.config);
             (c.archive.every_minutes, c.store.retention_days)
@@ -683,8 +689,10 @@ mod tests {
         assert_eq!(status_of(None, &ok, 100, "m", now), (State::Ok, "m".to_string()));
         let failing = Snapshot { in_a_row: 1, last_error: "HTTP 503".into(), ..Default::default() };
         assert_eq!(status_of(None, &failing, 100, "m", now), (State::Warning, "engine degraded: HTTP 503".to_string()));
-        let full = Snapshot { queued: 51, ..failing.clone() };
+        let full = Snapshot { queued: 51, live: 31, retrying: 20, ..failing.clone() };
         assert_eq!(status_of(None, &full, 100, "m", now), (State::Warning, "51 calls queued".to_string()));
+        let backlog = Snapshot { queued: 90, live: 10, archive: 80, ..Default::default() };
+        assert_eq!(status_of(None, &backlog, 100, "m", now), (State::Ok, "m".to_string()), "archive work is meant to queue up");
         let down = Snapshot { down_since: Some(now - Duration::from_secs(360)), ..full.clone() };
         assert_eq!(status_of(None, &down, 100, "m", now), (State::Error, "engine down since 6 min: HTTP 503".to_string()));
         let lately = Snapshot { down_since: Some(now - Duration::from_secs(60)), ..full };
@@ -707,9 +715,10 @@ mod tests {
         let c = speech_call(&dir, 451);
         let hello = hello_with(&dir, s.url(), json!({ "engine": { "concurrency": 1 } }));
         let t0 = Instant::now();
-        let out = testing::run::<Transcribe>([HostMessage::Hello(hello), HostMessage::CallConcluded(c)]);
+        let out = testing::run::<Transcribe>([HostMessage::Hello(hello), HostMessage::CallConcluded(c.clone())]);
         assert!(t0.elapsed() < Duration::from_millis(9500), "took {:?} of a 10 s grace", t0.elapsed());
-        assert!(out.results().is_empty(), "the call in flight had no answer to give");
+        let results: Vec<_> = out.results().into_iter().map(|r| (r.0, r.1, r.2)).collect();
+        assert_eq!(results, [(c.path.clone(), Outcome::Failed, "shutting down".to_string())], "exactly one answer for the call in flight");
     }
 
     #[test]
@@ -724,6 +733,8 @@ mod tests {
         assert_eq!(m.endpoints.len(), 1);
         assert_eq!((m.endpoints[0].name.as_str(), m.endpoints[0].state), (host_of(s.url()).as_str(), EndpointState::Up));
         assert_eq!(m.extra["transcribed"], json!(1));
+        assert_eq!(m.extra["failures"], json!(0));
+        assert_eq!(metrics_of(&Snapshot { failed: 4, ..Default::default() }, "http://e", 0, "m").extra["failures"], json!(4));
         assert_eq!(m.extra["model"], json!("Qwen3-ASR-1.7B"));
         assert!(m.last_ok.is_some() && m.latency_ms.is_some());
         assert_eq!(out.status(), Some((State::Ok, "Qwen3-ASR-1.7B".to_string())));

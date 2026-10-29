@@ -1,12 +1,13 @@
 //! The archive pass: pages the recorder's call store through `calls.query` and
 //! queues the calls that have no transcript yet (or, for a re-transcribe, a
-//! transcript from another model).
+//! transcript from another model). It queues at most half the queue's room;
+//! past that it pauses, and the next pass takes up the rest.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use trunk_recorder_plugin::{CallFiles, CallsPage, CallsQuery, ConcludedCall, Host, StoredCall};
 
@@ -18,6 +19,8 @@ const DAY_MS: i64 = 86_400_000;
 const PAGE: usize = 500;
 /// A failed call is tried again by a pass until it has failed this often.
 const GIVE_UP_AFTER: u32 = 10;
+/// A page not come this long after it was asked ends the pass.
+const PAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What a pass is for.
 #[derive(Debug, Clone, PartialEq)]
@@ -48,6 +51,10 @@ struct Pass {
     from: Option<i64>,
     /// Re-transcribe only: the paths to do again.
     candidates: HashSet<String>,
+    /// Ends at the first page with nothing to do (a periodic pass, unless the last pass paused).
+    stop_early: bool,
+    /// When the page awaited was asked for.
+    asked: Instant,
     queued: u32,
     skipped: u32,
     pages: u32,
@@ -61,11 +68,13 @@ pub struct Archive {
     days: Arc<AtomicU32>,
     capture_dir: PathBuf,
     pass: Option<Pass>,
+    /// The last pass paused with calls left: the next periodic one goes through the whole window.
+    resume: bool,
 }
 
 impl Archive {
     pub fn new(host: Host, store: Store, queue: Arc<Queue>, systems: Arc<RwLock<Vec<SystemView>>>, days: Arc<AtomicU32>, capture_dir: PathBuf) -> Archive {
-        Archive { host, store, queue, systems, days, capture_dir, pass: None }
+        Archive { host, store, queue, systems, days, capture_dir, pass: None, resume: false }
     }
 
     pub fn running(&self) -> bool {
@@ -98,10 +107,26 @@ impl Archive {
                 }
             }
         }
+        let stop_early = match mode {
+            Mode::Periodic => !std::mem::take(&mut self.resume),
+            Mode::Start => {
+                self.resume = false;
+                false
+            }
+            Mode::Retranscribe { .. } => false,
+        };
         self.host.info(format!("archive pass started ({})", mode.label()));
         let request = self.host.calls(CallsQuery { from, limit: Some(PAGE), ..Default::default() });
-        self.pass = Some(Pass { request, mode, from, candidates, queued: 0, skipped: 0, pages: 0 });
+        self.pass = Some(Pass { request, mode, from, candidates, stop_early, asked: Instant::now(), queued: 0, skipped: 0, pages: 0 });
         Ok(true)
+    }
+
+    /// Ends the pass when the page it asked for has not come in `PAGE_TIMEOUT`; true when it did.
+    pub fn check_timeout(&mut self, now: Instant) -> bool {
+        let Some(pass) = self.pass.take_if(|p| now.saturating_duration_since(p.asked) >= PAGE_TIMEOUT) else { return false };
+        self.host.warn(format!("archive pass: no answer from the recorder's call store in {} s", PAGE_TIMEOUT.as_secs()));
+        self.finish(&pass);
+        true
     }
 
     /// Handles a page of the recorder's call store; false when it is not this pass's.
@@ -117,12 +142,17 @@ impl Archive {
             self.finish(&pass);
             return true;
         }
-        let (queued, skipped) = self.work_page(&pass, &page.entries);
+        let (queued, skipped, paused) = self.work_page(&pass, &page.entries);
         pass.queued += queued;
         pass.skipped += skipped;
-        let stop = pass.mode == Mode::Periodic && queued == 0 && skipped == 0;
-        if page.more && !stop {
+        let stop = pass.stop_early && queued == 0 && skipped == 0;
+        if paused {
+            self.host.info(format!("archive pass paused: {} calls queued, the rest waits for the next pass", self.queue.archive_waiting()));
+            self.resume = !matches!(pass.mode, Mode::Retranscribe { .. });
+            self.finish(&pass);
+        } else if page.more && !stop {
             pass.request = self.host.calls(CallsQuery { from: pass.from, before: Some(page.before), limit: Some(PAGE), ..Default::default() });
+            pass.asked = Instant::now();
             self.pass = Some(pass);
         } else {
             self.finish(&pass);
@@ -134,8 +164,10 @@ impl Archive {
         self.host.info(format!("archive pass: {} queued, {} skipped, {} pages", pass.queued, pass.skipped, pass.pages));
     }
 
-    /// Queues what needs a transcript; returns (queued, skipped).
-    fn work_page(&self, pass: &Pass, entries: &[StoredCall]) -> (u32, u32) {
+    /// Queues what needs a transcript, until the queue holds half its room of
+    /// archive work; returns (queued, skipped, whether it stopped there).
+    fn work_page(&self, pass: &Pass, entries: &[StoredCall]) -> (u32, u32, bool) {
+        let budget = (self.queue.max() / 2).max(1);
         let retranscribe = matches!(pass.mode, Mode::Retranscribe { .. });
         let settled = if retranscribe {
             Default::default()
@@ -167,6 +199,9 @@ impl Archive {
                     continue;
                 }
             }
+            if self.queue.archive_waiting() >= budget {
+                return (queued, skipped, true);
+            }
             let system = systems.iter().position(|s| s.short_name == e.record.short_name).unwrap_or(0) as u16;
             let call = ConcludedCall {
                 path: e.path.clone(),
@@ -179,7 +214,7 @@ impl Archive {
                 queued += 1;
             }
         }
-        (queued, skipped)
+        (queued, skipped, false)
     }
 
     /// Writes the `skipped, "no audio"` row of a call whose audio was not kept.
@@ -235,17 +270,22 @@ mod tests {
     }
 
     fn fixture(store: Store) -> Fx {
+        fixture_of(store, 1, 1000)
+    }
+
+    /// A fixture whose queue has `workers` workers (0: nothing is ever taken) and room for `max`.
+    fn fixture_of(store: Store, workers: usize, max: usize) -> Fx {
         let (host, out) = testing::capture();
         let seen = Seen::default();
         let s = seen.clone();
         let queue = Arc::new(Queue::start(
             host.clone(),
-            QueueOptions { workers: 1, max: 1000, retry_after: vec![Duration::from_millis(20)], max_age: Duration::from_secs(3000) },
+            QueueOptions { workers, max, retry_after: vec![Duration::from_millis(20)], max_age: Duration::from_secs(3000) },
             move |job| {
                 s.lock().unwrap().push((job.kind.clone(), job.call.path.clone()));
                 Done::Ok { took: Duration::ZERO }
             },
-            |_, _| {},
+            |_, _, _| {},
         ));
         let systems = Arc::new(RwLock::new(vec![SystemView { short_name: "sys1".into(), name: String::new(), enabled: true, settings: Config::default() }]));
         let archive = Archive::new(host, store.clone(), queue.clone(), systems, Arc::new(AtomicU32::new(7)), PathBuf::from("cap"));
@@ -431,7 +471,7 @@ mod tests {
                 w.lock().unwrap().push(job.call.files.clone());
                 Done::Ok { took: Duration::ZERO }
             },
-            |_, _| {},
+            |_, _, _| {},
         ));
         let systems = Arc::new(RwLock::new(Vec::new()));
         let mut archive = Archive::new(host, Store::in_memory(), queue.clone(), systems, Arc::new(AtomicU32::new(7)), PathBuf::from("cap"));
@@ -457,6 +497,52 @@ mod tests {
         assert!(!f.archive.running());
         assert!(queries(&f).is_empty());
         assert_eq!(logs(&f, Level::Warn).len(), 1);
+    }
+
+    #[test]
+    fn a_pass_queues_up_to_half_the_queue_and_pauses() {
+        let mut f = fixture_of(Store::in_memory(), 0, 10);
+        assert!(f.archive.begin(Mode::Start, DAY_MS * 50).unwrap());
+        let req = queries(&f)[0].request;
+        let entries: Vec<_> = (0..8).map(|i| stored(&format!("c{i}"), true)).collect();
+        assert!(f.archive.on_page(page(req, entries, true, 500)));
+        assert_eq!(f.queue.archive_waiting(), 5, "the budget is half of max 10");
+        assert!(!f.archive.running(), "the pass ended");
+        assert_eq!(queries(&f).len(), 1, "no further page asked");
+        let infos = logs(&f, Level::Info);
+        assert!(infos.contains(&"archive pass paused: 5 calls queued, the rest waits for the next pass".to_string()), "{infos:?}");
+        assert!(infos.contains(&"archive pass: 5 queued, 0 skipped, 1 pages".to_string()), "{infos:?}");
+        assert!(f.store.get("c0").unwrap().is_none(), "queueing writes no row");
+
+        // The next periodic pass goes on past a page with nothing to do...
+        f.store.put(&row("s1", Status::Ok, 1, None), &[]).unwrap();
+        assert!(f.archive.begin(Mode::Periodic, DAY_MS * 50).unwrap());
+        let req = queries(&f)[1].request;
+        assert!(f.archive.on_page(page(req, vec![stored("s1", true)], true, 400)));
+        assert_eq!(queries(&f).len(), 3, "it asked for the next page");
+        let req = queries(&f)[2].request;
+        assert!(f.archive.on_page(page(req, vec![], false, 0)));
+        // ...and the one after stops early again.
+        assert!(f.archive.begin(Mode::Periodic, DAY_MS * 50).unwrap());
+        let req = queries(&f)[3].request;
+        assert!(f.archive.on_page(page(req, vec![stored("s1", true)], true, 400)));
+        assert_eq!(queries(&f).len(), 4);
+        assert!(!f.archive.running());
+    }
+
+    #[test]
+    fn a_page_that_never_comes_ends_the_pass() {
+        let mut f = fixture(Store::in_memory());
+        assert!(!f.archive.check_timeout(Instant::now()), "no pass, nothing to end");
+        assert!(f.archive.begin(Mode::Start, DAY_MS * 50).unwrap());
+        assert!(!f.archive.check_timeout(Instant::now() + Duration::from_secs(30)));
+        assert!(f.archive.running());
+        assert!(f.archive.check_timeout(Instant::now() + Duration::from_secs(61)));
+        assert!(!f.archive.running());
+        assert_eq!(logs(&f, Level::Warn), ["archive pass: no answer from the recorder's call store in 60 s"]);
+        let req = queries(&f)[0].request;
+        assert!(!f.archive.on_page(page(req, vec![stored("late", true)], false, 0)), "a late page is not the pass's");
+        assert!(f.archive.begin(Mode::Start, DAY_MS * 50).unwrap(), "a new pass can start");
     }
 
     #[test]

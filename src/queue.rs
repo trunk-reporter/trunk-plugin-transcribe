@@ -3,9 +3,10 @@
 //! Live calls go first (oldest first), then retries that are due, then archive
 //! work (a backfill or a retranscription) on one worker at a time, so the
 //! recorder's live calls never wait behind a backfill. Every live job ends in
-//! exactly one `call.result`; archive and retranscribe jobs send none.
+//! exactly one `call.result`; archive and retranscribe jobs send none, unless a
+//! live call for the same path joins them, which makes them live.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -48,7 +49,11 @@ pub enum Done {
         took: Duration,
     },
     Skipped(String),
+    /// The engine failed it.
     Failed(String),
+    /// It failed for a cause of our own (unreadable audio, the store, a
+    /// panic): ended like `Failed`, but not counted against the engine.
+    Local(String),
     /// The engine is down for now: try again later.
     Retry(String),
 }
@@ -61,7 +66,7 @@ pub struct QueueOptions {
     pub max: usize,
     /// The wait before each retry (2 s, 8 s, 30 s); after the last, the job gives up.
     pub retry_after: Vec<Duration>,
-    /// A job older than this when a worker takes it fails with "engine down" (50 min).
+    /// A live job older than this when a worker takes it fails with "engine down" (50 min).
     pub max_age: Duration,
 }
 
@@ -100,13 +105,23 @@ const DOWN_AFTER: u32 = 3;
 const FULL_WARN_EVERY: Duration = Duration::from_secs(60);
 
 type Work = dyn Fn(&Job) -> Done + Send + Sync;
-type Failed = dyn Fn(&Job, &str) + Send + Sync;
+type Failed = dyn Fn(&Job, &str, bool) + Send + Sync;
 
 /// How a job ended.
 enum End {
     Ok(Duration),
     Skipped(String),
-    Failed(String),
+    /// Why, and whether the job was ever tried (a drop before any try is not).
+    Failed(String, bool),
+}
+
+/// A job a worker is on.
+struct Flight {
+    /// Its end goes to the recorder as a `call.result`: a live job, or an
+    /// archive job a live call joined while it ran.
+    live: bool,
+    /// That `call.result` has gone already (at shutdown): its end sends none.
+    answered: bool,
 }
 
 #[derive(Default)]
@@ -117,6 +132,8 @@ struct Inner {
     retrying: Vec<(Instant, Job)>,
     /// The paths queued or in flight.
     paths: HashSet<String>,
+    /// The jobs in flight, by path.
+    flying: HashMap<String, Flight>,
     in_flight: usize,
     /// A worker is on an archive job.
     archive_busy: bool,
@@ -160,6 +177,33 @@ impl Inner {
             (Some(_), _) => ready.pop_front(),
             (None, Some((i, _))) => Some(self.retrying.swap_remove(i).1),
             (None, None) => None,
+        }
+    }
+
+    /// A live call for a path already queued or in flight. An archive job for
+    /// it becomes live (moved to the live lane, or, in flight, answered as
+    /// live when it ends): true. A live job for it answers already: false.
+    fn join_live(&mut self, live: Job) -> bool {
+        let path = live.call.path.as_str();
+        if let Some(i) = self.archive.iter().position(|j| j.call.path == path) {
+            self.archive.remove(i);
+            self.live.push_back(live);
+            return true;
+        }
+        if let Some((_, job)) = self.retrying.iter_mut().find(|(_, j)| j.call.path == path) {
+            if job.kind == Kind::Live {
+                return false;
+            }
+            job.kind = Kind::Live;
+            job.call = live.call;
+            return true;
+        }
+        match self.flying.get_mut(path) {
+            Some(flight) if !flight.live => {
+                flight.live = true;
+                true
+            }
+            _ => false,
         }
     }
 
@@ -219,6 +263,7 @@ impl Shared {
             }
             let now = Instant::now();
             if let Some(job) = inner.take(now) {
+                inner.flying.insert(job.call.path.clone(), Flight { live: job.kind == Kind::Live, answered: false });
                 inner.in_flight += 1;
                 inner.archive_busy |= job.kind.is_archive();
                 drop(inner);
@@ -236,11 +281,12 @@ impl Shared {
     /// Works `job` (taken, and counted in flight) to its end or its next retry.
     fn run(&self, mut job: Job) {
         let archive = job.kind.is_archive();
-        let end = if job.enqueued.elapsed() > self.opts.max_age {
+        // The age rule is for live calls: archive work is expected to wait.
+        let end = if job.kind == Kind::Live && job.enqueued.elapsed() > self.opts.max_age {
             self.lock().stats.failed += 1;
-            End::Failed("engine down".into())
+            End::Failed("engine down".into(), false)
         } else {
-            let done = catch_unwind(AssertUnwindSafe(|| (self.work)(&job))).unwrap_or_else(|_| Done::Failed("the work panicked".into()));
+            let done = catch_unwind(AssertUnwindSafe(|| (self.work)(&job))).unwrap_or_else(|_| Done::Local("the work panicked".into()));
             let mut inner = self.lock();
             match done {
                 Done::Ok { took } => {
@@ -251,16 +297,24 @@ impl Shared {
                 Done::Failed(m) => {
                     inner.engine_error(&m);
                     inner.stats.failed += 1;
-                    End::Failed(m)
+                    End::Failed(m, true)
+                }
+                Done::Local(m) => {
+                    inner.stats.failed += 1;
+                    End::Failed(m, true)
                 }
                 Done::Retry(m) => {
                     inner.engine_error(&m);
                     let tries = job.tries as usize;
                     if inner.closing {
                         inner.stats.failed += 1;
-                        End::Failed("shutting down".into())
+                        End::Failed("shutting down".into(), true)
                     } else if tries < self.opts.retry_after.len() {
                         let message = format!("retry {}/{} for {}: {m}", tries + 1, self.opts.retry_after.len(), job.call.path);
+                        // A live call that joined it while it ran makes it live from here on.
+                        if inner.flying.remove(&job.call.path).is_some_and(|f| f.live) {
+                            job.kind = Kind::Live;
+                        }
                         job.tries += 1;
                         inner.stats.retries += 1;
                         inner.retrying.push((Instant::now() + self.opts.retry_after[tries], job));
@@ -271,29 +325,36 @@ impl Shared {
                         return;
                     } else {
                         inner.stats.failed += 1;
-                        End::Failed(format!("gave up: {m}"))
+                        End::Failed(format!("gave up: {m}"), true)
                     }
                 }
             }
         };
-        self.answer(&job, &end);
-        let mut inner = self.lock();
-        inner.paths.remove(&job.call.path);
-        inner.release(archive);
+        // Whether the end goes to the recorder is settled as the flight ends, under the lock.
+        let result = {
+            let mut inner = self.lock();
+            inner.paths.remove(&job.call.path);
+            let flight = inner.flying.remove(&job.call.path);
+            if flight.as_ref().is_some_and(|f| f.live) {
+                job.kind = Kind::Live;
+            }
+            flight.map_or(job.kind == Kind::Live, |f| f.live && !f.answered)
+        };
+        self.answer(&job, &end, result);
+        self.lock().release(archive);
         self.changed.notify_all();
     }
 
-    /// Tells the plugin of a failure (first, so its record exists), then the
-    /// recorder of a live job's end. Called with no lock held.
-    fn answer(&self, job: &Job, end: &End) {
-        let live = job.kind == Kind::Live;
+    /// Tells the plugin of a failure (first, so its record exists), then, when
+    /// `result`, the recorder of the job's end. Called with no lock held.
+    fn answer(&self, job: &Job, end: &End, result: bool) {
         let path = job.call.path.as_str();
         match end {
-            End::Ok(took) if live => self.host.call_result_took(path, Outcome::Ok, "", "", *took),
-            End::Skipped(m) if live => self.host.call_result(path, Outcome::Skipped, m.as_str(), ""),
-            End::Failed(m) => {
-                let _ = catch_unwind(AssertUnwindSafe(|| (self.failed)(job, m)));
-                if live {
+            End::Ok(took) if result => self.host.call_result_took(path, Outcome::Ok, "", "", *took),
+            End::Skipped(m) if result => self.host.call_result(path, Outcome::Skipped, m.as_str(), ""),
+            End::Failed(m, ran) => {
+                let _ = catch_unwind(AssertUnwindSafe(|| (self.failed)(job, m, *ran)));
+                if result {
                     self.host.call_result(path, Outcome::Failed, m.as_str(), "");
                 }
             }
@@ -310,13 +371,13 @@ pub struct Queue {
 
 impl Queue {
     /// Starts `opts.workers` threads (`transcribe-<i>`) running `work` on each
-    /// job; `failed` hears of every job that ends failed, on the thread that
-    /// ends it, before its `call.result`.
+    /// job; `failed` hears of every job that ends failed (why, and whether it
+    /// was ever tried), on the thread that ends it, before its `call.result`.
     pub fn start(
         host: Host,
         opts: QueueOptions,
         work: impl Fn(&Job) -> Done + Send + Sync + 'static,
-        failed: impl Fn(&Job, &str) + Send + Sync + 'static,
+        failed: impl Fn(&Job, &str, bool) + Send + Sync + 'static,
     ) -> Queue {
         let workers = opts.workers;
         let shared =
@@ -330,21 +391,26 @@ impl Queue {
         Queue { shared, workers: Mutex::new(workers) }
     }
 
-    /// Queues `call`. False (and nothing happens) when a job with its path is
-    /// queued or in flight. When `max` jobs are waiting, the oldest archive
-    /// job is dropped ("queue full"), else the oldest live one. Once shutdown
-    /// has begun, the job is answered at once with "shutting down".
+    /// Queues `call`. When a job with its path is queued or in flight, a live
+    /// call joins an archive job for it, which then answers the recorder
+    /// (true); anything else is refused (false, and nothing happens). When
+    /// `max` jobs are waiting, the oldest archive job is dropped ("queue
+    /// full"), else the oldest live one. Once shutdown has begun, the job is
+    /// answered at once with "shutting down".
     pub fn push(&self, call: ConcludedCall, kind: Kind) -> bool {
         let s = &self.shared;
         let job = Job { call, kind, enqueued: Instant::now(), tries: 0 };
         let mut inner = s.lock();
         if inner.paths.contains(&job.call.path) {
-            return false;
+            let joined = job.kind == Kind::Live && inner.join_live(job);
+            s.changed.notify_all();
+            return joined;
         }
         if inner.closing {
             inner.stats.failed += 1;
             drop(inner);
-            s.answer(&job, &End::Failed("shutting down".into()));
+            let live = job.kind == Kind::Live;
+            s.answer(&job, &End::Failed("shutting down".into(), false), live);
             return true;
         }
         let mut dropped = None;
@@ -372,7 +438,8 @@ impl Queue {
             if warn {
                 s.host.warn(format!("queue full ({} waiting): dropping the oldest, {}", s.opts.max, old.call.path));
             }
-            s.answer(&old, &End::Failed("queue full".into()));
+            let (ran, live) = (old.tries > 0, old.kind == Kind::Live);
+            s.answer(&old, &End::Failed("queue full".into(), ran), live);
         }
         true
     }
@@ -386,6 +453,39 @@ impl Queue {
             retrying: inner.retrying.len(),
             in_flight: inner.in_flight,
             ..inner.stats.clone()
+        }
+    }
+
+    /// Archive and retranscribe jobs waiting, ready or for a retry.
+    pub fn archive_waiting(&self) -> usize {
+        let inner = self.shared.lock();
+        inner.archive.len() + inner.retrying.iter().filter(|(_, j)| j.kind.is_archive()).count()
+    }
+
+    /// How many jobs may wait.
+    pub fn max(&self) -> usize {
+        self.shared.opts.max
+    }
+
+    /// Answers every live job still in flight with `failed, reason`, once: its
+    /// own end, should it come, sends nothing more.
+    pub fn answer_in_flight(&self, reason: &str) {
+        let s = &self.shared;
+        let mut paths: Vec<String> = {
+            let mut inner = s.lock();
+            inner
+                .flying
+                .iter_mut()
+                .filter(|(_, f)| f.live && !f.answered)
+                .map(|(path, f)| {
+                    f.answered = true;
+                    path.clone()
+                })
+                .collect()
+        };
+        paths.sort();
+        for path in paths {
+            s.host.call_result(&path, Outcome::Failed, reason, "");
         }
     }
 
@@ -419,7 +519,7 @@ impl Queue {
             jobs
         };
         for job in &waiting {
-            s.answer(job, &End::Failed("shutting down".into()));
+            s.answer(job, &End::Failed("shutting down".into(), job.tries > 0), job.kind == Kind::Live);
         }
         let mut inner = s.lock();
         while inner.in_flight > 0 {
@@ -465,13 +565,17 @@ mod tests {
         }
     }
 
-    type Failures = Arc<Mutex<Vec<(String, String)>>>;
+    type Failures = Arc<Mutex<Vec<(String, String, bool)>>>;
 
-    /// A `failed` callback that keeps (path, message).
-    fn failures() -> (Failures, impl Fn(&Job, &str) + Send + Sync + 'static) {
+    /// A `failed` callback that keeps (path, message, tried).
+    fn failures() -> (Failures, impl Fn(&Job, &str, bool) + Send + Sync + 'static) {
         let kept = Failures::default();
         let k = kept.clone();
-        (kept, move |job: &Job, m: &str| k.lock().unwrap().push((job.call.path.clone(), m.to_string())))
+        (kept, move |job: &Job, m: &str, ran: bool| k.lock().unwrap().push((job.call.path.clone(), m.to_string(), ran)))
+    }
+
+    fn failed(path: &str, m: &str, ran: bool) -> (String, String, bool) {
+        (path.to_string(), m.to_string(), ran)
     }
 
     /// A gate `work` can block on until the test opens it (by dropping the sender).
@@ -493,7 +597,7 @@ mod tests {
                 thread::sleep(TAKES);
                 Done::Ok { took: TAKES }
             },
-            |_: &Job, _: &str| {},
+            |_: &Job, _: &str, _: bool| {},
         );
         let dir = testing::temp_dir("queue-order");
         assert!(q.push(call(&dir, 1), Kind::Archive));
@@ -545,7 +649,7 @@ mod tests {
                 (p[2].clone(), Outcome::Failed, "HTTP 400".into(), String::new()),
             ]
         );
-        assert_eq!(*failures.lock().unwrap(), vec![(p[2].clone(), "HTTP 400".to_string())]);
+        assert_eq!(*failures.lock().unwrap(), vec![failed(&p[2], "HTTP 400", true)]);
         let took = o.messages.iter().find_map(|m| match m {
             PluginMessage::CallResult { path, took_ms, .. } if *path == p[0] => Some(*took_ms),
             _ => None,
@@ -584,7 +688,7 @@ mod tests {
         assert_eq!(results[0].0, p);
         assert_eq!(results[0].1, Outcome::Failed);
         assert!(results[0].2.starts_with("gave up: down"), "{:?}", results[0]);
-        assert_eq!(*failures.lock().unwrap(), vec![(p.clone(), "gave up: down".to_string())]);
+        assert_eq!(*failures.lock().unwrap(), vec![failed(&p, "gave up: down", true)]);
         let warns: Vec<String> = o.logs().into_iter().filter(|(l, _)| *l == Level::Warn).map(|(_, m)| m).collect();
         assert_eq!(warns, (1..=3).map(|n| format!("retry {n}/3 for {p}: down")).collect::<Vec<_>>());
         let s = q.snapshot();
@@ -626,11 +730,11 @@ mod tests {
         assert!(failures.lock().unwrap().is_empty());
 
         assert!(q.push(call(&dir, 4), Kind::Live));
-        assert_eq!(*failures.lock().unwrap(), vec![(pa1.clone(), "queue full".to_string())]);
+        assert_eq!(*failures.lock().unwrap(), vec![failed(&pa1, "queue full", false)], "never tried");
         assert!(out.output().results().is_empty(), "an archive job gets no call.result");
 
         assert!(q.push(call(&dir, 5), Kind::Live));
-        assert_eq!(*failures.lock().unwrap(), vec![(pa1, "queue full".to_string()), (pl1.clone(), "queue full".to_string())]);
+        assert_eq!(*failures.lock().unwrap(), vec![failed(&pa1, "queue full", false), failed(&pl1, "queue full", false)]);
         let o = out.output();
         assert_eq!(o.results(), vec![(pl1, Outcome::Failed, "queue full".into(), String::new())]);
         let warns = o.logs().into_iter().filter(|(l, m)| *l == Level::Warn && m.contains("queue full")).count();
@@ -655,12 +759,12 @@ mod tests {
                 let _ = shut.lock().unwrap().recv();
                 Done::Ok { took: Duration::ZERO }
             },
-            |_: &Job, _: &str| {},
+            |_: &Job, _: &str, _: bool| {},
         );
         let dir = testing::temp_dir("queue-dup");
         let c = call(&dir, 1);
         assert!(q.push(c.clone(), Kind::Live));
-        assert!(!q.push(c.clone(), Kind::Live), "queued or in flight: refused");
+        assert!(!q.push(c.clone(), Kind::Live), "live, queued or in flight: refused");
         assert!(!q.push(c.clone(), Kind::Archive), "whatever its kind");
         drop(open);
         wait_for("its result", || out.output().results().len() == 1 && q.is_empty());
@@ -701,7 +805,7 @@ mod tests {
         wait_for("both results", || out.output().results().len() == 2);
 
         assert_eq!(*worked.lock().unwrap(), vec![1]);
-        assert_eq!(*failures.lock().unwrap(), vec![(p2.clone(), "engine down".to_string())]);
+        assert_eq!(*failures.lock().unwrap(), vec![failed(&p2, "engine down", false)]);
         assert_eq!(out.output().results(), vec![(p1, Outcome::Ok, String::new(), String::new()), (p2, Outcome::Failed, "engine down".into(), String::new())]);
     }
 
@@ -733,13 +837,127 @@ mod tests {
         let t = Instant::now();
         q.shutdown(Duration::from_millis(100));
         assert!(t.elapsed() < Duration::from_millis(150), "shutdown took {:?}", t.elapsed());
-        assert_eq!(*failures.lock().unwrap(), vec![(p2.clone(), "shutting down".to_string()), (p3, "shutting down".to_string())]);
+        assert_eq!(*failures.lock().unwrap(), vec![failed(&p2, "shutting down", false), failed(&p3, "shutting down", false)]);
         assert_eq!(out.output().results(), vec![(p2, Outcome::Failed, "shutting down".into(), String::new())]);
 
         assert!(q.push(c4, Kind::Live), "after shutdown, a job is answered at once");
-        assert_eq!(failures.lock().unwrap().last().cloned(), Some((p4.clone(), "shutting down".to_string())));
+        assert_eq!(failures.lock().unwrap().last().cloned(), Some(failed(&p4, "shutting down", false)));
         assert_eq!(out.output().results().last().cloned(), Some((p4, Outcome::Failed, "shutting down".into(), String::new())));
         assert_eq!(*started.lock().unwrap(), 1);
         drop(open);
+    }
+
+    type Started = Arc<Mutex<Vec<(Kind, u32)>>>;
+
+    /// A queue whose work blocks until the gate opens, keeping (kind, tg) of each job it starts.
+    fn blocking(host: Host, opts: QueueOptions, on_failed: impl Fn(&Job, &str, bool) + Send + Sync + 'static) -> (Queue, Started, mpsc::Sender<()>) {
+        let (open, shut) = gate();
+        let started = Started::default();
+        let s = started.clone();
+        let q = Queue::start(
+            host,
+            opts,
+            move |job: &Job| {
+                s.lock().unwrap().push((job.kind.clone(), job.call.call.talkgroup));
+                let _ = shut.lock().unwrap().recv();
+                Done::Ok { took: Duration::ZERO }
+            },
+            on_failed,
+        );
+        (q, started, open)
+    }
+
+    #[test]
+    fn a_live_call_joins_its_waiting_archive_job() {
+        let (host, out) = testing::capture();
+        let (q, started, open) = blocking(host, opts(1), |_: &Job, _: &str, _: bool| {});
+        let dir = testing::temp_dir("queue-join");
+        assert!(q.push(call(&dir, 10), Kind::Live));
+        wait_for("the worker to be busy", || !started.lock().unwrap().is_empty());
+        let a = call(&dir, 1);
+        let pa = a.path.clone();
+        assert!(q.push(a.clone(), Kind::Archive));
+        assert!(q.push(call(&dir, 2), Kind::Archive));
+        assert!(q.push(a.clone(), Kind::Live), "a live call joins the archive job");
+        let s = q.snapshot();
+        assert_eq!((s.live, s.archive), (1, 1), "moved to the live lane");
+        assert!(!q.push(a, Kind::Live), "now live: a second live call is refused");
+        drop(open);
+        wait_for("all three done", || started.lock().unwrap().len() == 3 && q.is_empty());
+        assert_eq!(started.lock().unwrap()[1], (Kind::Live, 1), "worked once, as live, before archive 2");
+        let results: Vec<_> = out.output().results().into_iter().filter(|r| r.0 == pa).map(|r| r.1).collect();
+        assert_eq!(results, [Outcome::Ok]);
+    }
+
+    #[test]
+    fn a_live_call_joins_its_archive_job_in_flight() {
+        let (host, out) = testing::capture();
+        let (q, started, open) = blocking(host, opts(1), |_: &Job, _: &str, _: bool| {});
+        let dir = testing::temp_dir("queue-join-flight");
+        let a = call(&dir, 1);
+        let pa = a.path.clone();
+        assert!(q.push(a.clone(), Kind::Archive));
+        wait_for("the archive job to start", || !started.lock().unwrap().is_empty());
+        assert!(q.push(a.clone(), Kind::Live), "joins the archive job in flight");
+        assert!(!q.push(a, Kind::Live), "a second live call is refused");
+        drop(open);
+        wait_for("its result", || !out.output().results().is_empty() && q.is_empty());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(out.output().results(), vec![(pa, Outcome::Ok, String::new(), String::new())], "exactly one call.result");
+        assert_eq!(started.lock().unwrap().len(), 1, "worked once");
+    }
+
+    #[test]
+    fn an_old_archive_job_still_runs() {
+        let (host, out) = testing::capture();
+        let (failures, on_failed) = failures();
+        let max_age = Duration::from_millis(200);
+        let (q, started, open) = blocking(host, QueueOptions { max_age, ..opts(1) }, on_failed);
+        let dir = testing::temp_dir("queue-old-archive");
+        assert!(q.push(call(&dir, 1), Kind::Live));
+        wait_for("job 1 to start", || !started.lock().unwrap().is_empty());
+        assert!(q.push(call(&dir, 2), Kind::Archive));
+        thread::sleep(max_age * 2); // job 2 ages past max_age while job 1 holds the worker
+        drop(open);
+        wait_for("both worked", || started.lock().unwrap().len() == 2 && q.is_empty());
+        assert_eq!(started.lock().unwrap()[1], (Kind::Archive, 2));
+        assert!(failures.lock().unwrap().is_empty());
+        assert_eq!(out.output().results().len(), 1, "the live one's");
+    }
+
+    #[test]
+    fn a_local_failure_is_not_the_engines() {
+        let (host, out) = testing::capture();
+        let (failures, on_failed) = failures();
+        let q = Queue::start(host, opts(1), |_: &Job| Done::Local("store: disk full".into()), on_failed);
+        let dir = testing::temp_dir("queue-local");
+        let c = call(&dir, 1);
+        let p = c.path.clone();
+        assert!(q.push(c, Kind::Live));
+        wait_for("its result", || !out.output().results().is_empty() && q.is_empty());
+        assert_eq!(out.output().results(), vec![(p.clone(), Outcome::Failed, "store: disk full".into(), String::new())]);
+        assert_eq!(*failures.lock().unwrap(), vec![failed(&p, "store: disk full", true)]);
+        let s = q.snapshot();
+        assert_eq!((s.failed, s.in_a_row, s.down_since, s.last_error_s), (1, 0, None, None));
+    }
+
+    #[test]
+    fn answer_in_flight_answers_each_live_job_once() {
+        let (host, out) = testing::capture();
+        let (q, started, open) = blocking(host, opts(2), |_: &Job, _: &str, _: bool| {});
+        let dir = testing::temp_dir("queue-answer-in-flight");
+        let (l, a) = (call(&dir, 1), call(&dir, 2));
+        let pl = l.path.clone();
+        assert!(q.push(l, Kind::Live));
+        assert!(q.push(a, Kind::Archive));
+        wait_for("both in flight", || started.lock().unwrap().len() == 2);
+        q.answer_in_flight("shutting down");
+        q.answer_in_flight("shutting down");
+        let want = vec![(pl, Outcome::Failed, "shutting down".to_string(), String::new())];
+        assert_eq!(out.output().results(), want, "the live one only, once");
+        drop(open);
+        wait_for("both done", || q.is_empty());
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(out.output().results(), want, "the late end sends nothing");
     }
 }
