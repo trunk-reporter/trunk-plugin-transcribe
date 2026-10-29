@@ -208,8 +208,8 @@ impl Plugin for Transcribe {
         }
     }
 
-    fn calls(&mut self, page: CallsPage) {
-        lock(&self.archive).on_page(page);
+    fn calls(&mut self, request: u64, page: CallsPage) {
+        lock(&self.archive).on_page(request, page);
     }
 
     fn action(&mut self, a: Action, reply: Reply) {
@@ -565,7 +565,7 @@ mod tests {
         assert!(out.ready());
         assert_eq!(out.results().iter().map(|r| (r.0.as_str(), r.1)).collect::<Vec<_>>(), [(c.path.as_str(), Outcome::Ok)]);
         assert!(Store::open(&dir.join("data/transcripts.sqlite"), &|_| {}).unwrap().get(&c.path).unwrap().is_some());
-        let q = out.messages.iter().filter(|m| matches!(m, PluginMessage::CallsQuery(_))).count();
+        let q = out.messages.iter().filter(|m| matches!(m, PluginMessage::CallsQuery { .. })).count();
         assert_eq!(q, 1, "the start pass asked for calls once");
     }
 
@@ -595,8 +595,8 @@ mod tests {
         let dir = testing::temp_dir("plugin");
         let c = speech_call(&dir, 201);
         let stored = StoredCall { path: c.path.clone(), record: c.call.clone(), audio: true, json: true };
-        let page = CallsPage { request: 1, entries: vec![stored], more: false, before: 0, error: None };
-        let out = testing::run::<Transcribe>([HostMessage::Hello(hello_with(&dir, s.url(), json!({}))), HostMessage::Calls(page)]);
+        let page = CallsPage { entries: vec![stored], next: None, error: None };
+        let out = testing::run::<Transcribe>([HostMessage::Hello(hello_with(&dir, s.url(), json!({}))), HostMessage::Calls { request: 1, page }]);
         assert!(out.ready());
         let (row, _) = Store::open(&dir.join("data/transcripts.sqlite"), &|_| {}).unwrap().get(&c.path).unwrap().expect("a row for the archived call");
         assert_eq!(row.text.as_deref(), Some("Tower 73 go ahead"));
@@ -633,9 +633,12 @@ mod tests {
         let out = testing::run::<Transcribe>([HostMessage::Hello(hello_with(&dir, s.url(), json!({}))), HostMessage::Action(press(3))]);
         assert_eq!(action_results(&out), [(3, false, "An archive pass is already running".to_string())]);
         // Once it is done, one starts (with nothing to do, that is still a start).
-        let done = CallsPage { request: 1, entries: vec![], more: false, before: 0, error: None };
-        let out =
-            testing::run::<Transcribe>([HostMessage::Hello(hello_with(&dir, s.url(), json!({}))), HostMessage::Calls(done), HostMessage::Action(press(4))]);
+        let done = CallsPage { entries: vec![], next: None, error: None };
+        let out = testing::run::<Transcribe>([
+            HostMessage::Hello(hello_with(&dir, s.url(), json!({}))),
+            HostMessage::Calls { request: 1, page: done },
+            HostMessage::Action(press(4)),
+        ]);
         assert_eq!(action_results(&out), [(4, true, "Re-transcription started; the log says how many calls were queued".to_string())]);
     }
 

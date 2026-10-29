@@ -130,9 +130,9 @@ impl Archive {
     }
 
     /// Handles a page of the recorder's call store; false when it is not this pass's.
-    pub fn on_page(&mut self, page: CallsPage) -> bool {
+    pub fn on_page(&mut self, request: u64, page: CallsPage) -> bool {
         let Some(mut pass) = self.pass.take() else { return false };
-        if pass.request != page.request {
+        if pass.request != request {
             self.pass = Some(pass);
             return false;
         }
@@ -150,8 +150,8 @@ impl Archive {
             self.host.info(format!("archive pass paused: {} calls queued, the rest waits for the next pass", self.queue.archive_waiting()));
             self.resume = !matches!(pass.mode, Mode::Retranscribe { .. });
             self.finish(&pass);
-        } else if page.more && !stop {
-            pass.request = self.host.calls(CallsQuery { from: pass.from, before: Some(page.before), limit: Some(PAGE), ..Default::default() });
+        } else if let Some(cursor) = page.next.filter(|_| !stop) {
+            pass.request = self.host.calls(CallsQuery { from: pass.from, cursor: Some(cursor), limit: Some(PAGE), ..Default::default() });
             pass.asked = Instant::now();
             self.pass = Some(pass);
         } else {
@@ -323,17 +323,17 @@ mod tests {
         }
     }
 
-    fn page(request: u64, entries: Vec<StoredCall>, more: bool, before: i64) -> CallsPage {
-        CallsPage { request, entries, more, before, error: None }
+    fn page(entries: Vec<StoredCall>, next: Option<&str>) -> CallsPage {
+        CallsPage { entries, next: next.map(str::to_owned), error: None }
     }
 
-    fn queries(f: &Fx) -> Vec<CallsQuery> {
+    fn queries(f: &Fx) -> Vec<(u64, CallsQuery)> {
         f.out
             .output()
             .messages
             .into_iter()
             .filter_map(|m| match m {
-                PluginMessage::CallsQuery(q) => Some(q),
+                PluginMessage::CallsQuery { request, query } => Some((request, query)),
                 _ => None,
             })
             .collect()
@@ -370,16 +370,16 @@ mod tests {
         assert!(f.archive.begin(Mode::Start, now).unwrap());
         let q = queries(&f);
         assert_eq!(q.len(), 1);
-        assert_eq!((q[0].from, q[0].limit, q[0].before), (Some(now - 7 * DAY_MS), Some(500), None));
+        assert_eq!((q[0].1.from, q[0].1.limit, q[0].1.cursor.as_deref()), (Some(now - 7 * DAY_MS), Some(500), None));
 
-        let req = q[0].request;
-        assert!(f.archive.on_page(page(req, vec![stored("a", true), stored("b", true), stored("f", true), stored("g", true)], true, 500)));
+        let req = q[0].0;
+        assert!(f.archive.on_page(req, page(vec![stored("a", true), stored("b", true), stored("f", true), stored("g", true)], Some("500"))));
         let q = queries(&f);
         assert_eq!(q.len(), 2);
-        assert_eq!((q[1].before, q[1].from), (Some(500), Some(now - 7 * DAY_MS)));
+        assert_eq!((q[1].1.cursor.as_deref(), q[1].1.from), (Some("500"), Some(now - 7 * DAY_MS)));
         assert!(f.archive.running());
 
-        assert!(f.archive.on_page(page(q[1].request, vec![stored("c", false), stored("d", true)], false, 0)));
+        assert!(f.archive.on_page(q[1].0, page(vec![stored("c", false), stored("d", true)], None)));
         assert!(!f.archive.running());
         assert_eq!(drained(&f, 3), [pair("Archive", "b"), pair("Archive", "d"), pair("Archive", "f")]);
         assert_eq!(queries(&f).len(), 2);
@@ -399,8 +399,8 @@ mod tests {
         s.put(&row("b", Status::Empty, 1, None), &[]).unwrap();
         let mut f = fixture(s);
         assert!(f.archive.begin(Mode::Periodic, DAY_MS * 50).unwrap());
-        let req = queries(&f)[0].request;
-        assert!(f.archive.on_page(page(req, vec![stored("a", true), stored("b", true)], true, 500)));
+        let req = queries(&f)[0].0;
+        assert!(f.archive.on_page(req, page(vec![stored("a", true), stored("b", true)], Some("500"))));
         assert_eq!(queries(&f).len(), 1);
         assert!(!f.archive.running());
         assert!(logs(&f, Level::Info).contains(&"archive pass: 0 queued, 0 skipped, 1 pages".to_string()));
@@ -410,9 +410,9 @@ mod tests {
     fn the_store_being_off_is_logged_once_and_the_pass_ends() {
         let mut f = fixture(Store::in_memory());
         f.archive.begin(Mode::Start, DAY_MS * 50).unwrap();
-        let req = queries(&f)[0].request;
-        let p = CallsPage { request: req, error: Some("the call store is off".into()), ..Default::default() };
-        assert!(f.archive.on_page(p));
+        let req = queries(&f)[0].0;
+        let p = CallsPage { error: Some("the call store is off".into()), ..Default::default() };
+        assert!(f.archive.on_page(req, p));
         assert!(!f.archive.running());
         assert_eq!(queries(&f).len(), 1);
         let warns = logs(&f, Level::Warn);
@@ -432,8 +432,8 @@ mod tests {
         let now = 7 * DAY_MS;
         assert!(f.archive.begin(Mode::Retranscribe { everything: false, model: "m2".into() }, now).unwrap());
         let q = queries(&f);
-        assert_eq!(q[0].from, Some(now - 7 * DAY_MS));
-        assert!(f.archive.on_page(page(q[0].request, vec![stored("a", true), stored("b", true), stored("c", true), stored("d", true)], false, 0)));
+        assert_eq!(q[0].1.from, Some(now - 7 * DAY_MS));
+        assert!(f.archive.on_page(q[0].0, page(vec![stored("a", true), stored("b", true), stored("c", true), stored("d", true)], None)));
         assert_eq!(drained(&f, 2), [pair("Retranscribe", "a"), pair("Retranscribe", "c")]);
         assert!(logs(&f, Level::Info).contains(&"archive pass started (re-transcribe)".to_string()));
 
@@ -441,10 +441,10 @@ mod tests {
         assert!(f.archive.begin(Mode::Retranscribe { everything: true, model: "m2".into() }, now).unwrap());
         let q = queries(&f);
         assert_eq!(q.len(), 2);
-        assert_eq!(q[1].from, None);
+        assert_eq!(q[1].1.from, None);
         assert!(logs(&f, Level::Info).contains(&"archive pass started (re-transcribe of everything)".to_string()));
         // A candidate without audio is left as it is.
-        assert!(f.archive.on_page(page(q[1].request, vec![stored("a", false)], false, 0)));
+        assert!(f.archive.on_page(q[1].0, page(vec![stored("a", false)], None)));
         assert_eq!(f.store.get("a").unwrap().unwrap().0.status, Status::Ok);
         assert!(!f.archive.running());
 
@@ -476,7 +476,7 @@ mod tests {
         let systems = Arc::new(RwLock::new(Vec::new()));
         let mut archive = Archive::new(host, Store::in_memory(), queue.clone(), systems, Arc::new(AtomicU32::new(7)), PathBuf::from("cap"));
         assert!(archive.begin(Mode::Start, DAY_MS * 50).unwrap());
-        assert!(archive.on_page(page(1, vec![stored("sys1/851012500.0-call_1", true)], false, 0)));
+        assert!(archive.on_page(1, page(vec![stored("sys1/851012500.0-call_1", true)], None)));
         let deadline = Instant::now() + Duration::from_secs(10);
         while files.lock().unwrap().is_empty() {
             assert!(Instant::now() < deadline, "timed out waiting for the worker");
@@ -503,9 +503,9 @@ mod tests {
     fn a_pass_queues_up_to_half_the_queue_and_pauses() {
         let mut f = fixture_of(Store::in_memory(), 0, 10);
         assert!(f.archive.begin(Mode::Start, DAY_MS * 50).unwrap());
-        let req = queries(&f)[0].request;
+        let req = queries(&f)[0].0;
         let entries: Vec<_> = (0..8).map(|i| stored(&format!("c{i}"), true)).collect();
-        assert!(f.archive.on_page(page(req, entries, true, 500)));
+        assert!(f.archive.on_page(req, page(entries, Some("500"))));
         assert_eq!(f.queue.archive_waiting(), 5, "the budget is half of max 10");
         assert!(!f.archive.running(), "the pass ended");
         assert_eq!(queries(&f).len(), 1, "no further page asked");
@@ -517,15 +517,15 @@ mod tests {
         // The next periodic pass goes on past a page with nothing to do...
         f.store.put(&row("s1", Status::Ok, 1, None), &[]).unwrap();
         assert!(f.archive.begin(Mode::Periodic, DAY_MS * 50).unwrap());
-        let req = queries(&f)[1].request;
-        assert!(f.archive.on_page(page(req, vec![stored("s1", true)], true, 400)));
+        let req = queries(&f)[1].0;
+        assert!(f.archive.on_page(req, page(vec![stored("s1", true)], Some("400"))));
         assert_eq!(queries(&f).len(), 3, "it asked for the next page");
-        let req = queries(&f)[2].request;
-        assert!(f.archive.on_page(page(req, vec![], false, 0)));
+        let req = queries(&f)[2].0;
+        assert!(f.archive.on_page(req, page(vec![], None)));
         // ...and the one after stops early again.
         assert!(f.archive.begin(Mode::Periodic, DAY_MS * 50).unwrap());
-        let req = queries(&f)[3].request;
-        assert!(f.archive.on_page(page(req, vec![stored("s1", true)], true, 400)));
+        let req = queries(&f)[3].0;
+        assert!(f.archive.on_page(req, page(vec![stored("s1", true)], Some("400"))));
         assert_eq!(queries(&f).len(), 4);
         assert!(!f.archive.running());
     }
@@ -540,8 +540,8 @@ mod tests {
         assert!(f.archive.check_timeout(Instant::now() + Duration::from_secs(61)));
         assert!(!f.archive.running());
         assert_eq!(logs(&f, Level::Warn), ["archive pass: no answer from the recorder's call store in 60 s"]);
-        let req = queries(&f)[0].request;
-        assert!(!f.archive.on_page(page(req, vec![stored("late", true)], false, 0)), "a late page is not the pass's");
+        let req = queries(&f)[0].0;
+        assert!(!f.archive.on_page(req, page(vec![stored("late", true)], None)), "a late page is not the pass's");
         assert!(f.archive.begin(Mode::Start, DAY_MS * 50).unwrap(), "a new pass can start");
     }
 
@@ -552,10 +552,10 @@ mod tests {
         assert!(!f.archive.begin(Mode::Periodic, DAY_MS * 50).unwrap());
         assert_eq!(queries(&f).len(), 1);
         // A page for another request is ignored.
-        assert!(!f.archive.on_page(page(999, vec![stored("x", true)], false, 0)));
+        assert!(!f.archive.on_page(999, page(vec![stored("x", true)], None)));
         assert!(f.archive.running());
-        let req = queries(&f)[0].request;
-        assert!(f.archive.on_page(page(req, vec![], false, 0)));
+        let req = queries(&f)[0].0;
+        assert!(f.archive.on_page(req, page(vec![], None)));
         assert!(f.archive.begin(Mode::Start, DAY_MS * 50).unwrap());
     }
 }
