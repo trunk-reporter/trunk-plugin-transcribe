@@ -50,23 +50,40 @@ fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
 
-/// Opens `path` with the pragmas set, and checks it. An `Err` means the file
-/// is not a usable database.
-fn open_checked(path: &Path) -> Result<Connection, String> {
-    let conn = Connection::open(path).map_err(err)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(err)?;
-    conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(())).map_err(err)?;
-    conn.pragma_update(None, "synchronous", "NORMAL").map_err(err)?;
-    conn.pragma_update(None, "foreign_keys", true).map_err(err)?;
-    let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(err)?;
+/// Why a database would not open.
+enum OpenFail {
+    /// The file is not a database, or is damaged: safe to move aside.
+    Corrupt(String),
+    /// Anything else (busy, I/O, permissions, full disk): the file is left alone.
+    Other(String),
+}
+
+fn classify(e: rusqlite::Error, path: &Path) -> OpenFail {
+    use rusqlite::ErrorCode::{DatabaseCorrupt, NotADatabase};
+    match &e {
+        rusqlite::Error::SqliteFailure(f, _) if matches!(f.code, NotADatabase | DatabaseCorrupt) => OpenFail::Corrupt(e.to_string()),
+        _ => OpenFail::Other(format!("cannot open the transcript database {}: {e}", path.display())),
+    }
+}
+
+/// Opens `path` with the pragmas set, and checks it.
+fn open_checked(path: &Path) -> Result<Connection, OpenFail> {
+    let c = |e| classify(e, path);
+    let conn = Connection::open(path).map_err(c)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5)).map_err(c)?;
+    conn.query_row("PRAGMA journal_mode = WAL", [], |_| Ok(())).map_err(c)?;
+    conn.pragma_update(None, "synchronous", "NORMAL").map_err(c)?;
+    conn.pragma_update(None, "foreign_keys", true).map_err(c)?;
+    let check: String = conn.query_row("PRAGMA quick_check", [], |r| r.get(0)).map_err(c)?;
     if check != "ok" {
-        return Err(format!("quick_check: {check}"));
+        return Err(OpenFail::Corrupt(format!("quick_check: {check}")));
     }
     Ok(conn)
 }
 
 /// Moves the database and its journal files aside; returns the main file's new name.
-fn move_aside(path: &Path) -> String {
+/// Any file that exists but cannot be moved is an `Err`.
+fn move_aside(path: &Path) -> Result<String, String> {
     let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let mut moved = path.display().to_string();
     for suffix in ["", "-wal", "-shm"] {
@@ -74,11 +91,14 @@ fn move_aside(path: &Path) -> String {
         from.push(suffix);
         let mut to = from.clone();
         to.push(format!(".corrupt-{secs}"));
-        if Path::new(&from).exists() && std::fs::rename(&from, &to).is_ok() && suffix.is_empty() {
-            moved = Path::new(&to).display().to_string();
+        if Path::new(&from).exists() {
+            std::fs::rename(&from, &to).map_err(|e| format!("cannot move the corrupt transcript database file {} aside: {e}", Path::new(&from).display()))?;
+            if suffix.is_empty() {
+                moved = Path::new(&to).display().to_string();
+            }
         }
     }
-    moved
+    Ok(moved)
 }
 
 fn init(conn: &Connection) -> Result<(), String> {
@@ -103,10 +123,14 @@ impl Store {
     pub fn open(path: &Path, warn: &dyn Fn(String)) -> Result<Store, String> {
         let conn = match open_checked(path) {
             Ok(c) => c,
-            Err(why) => {
-                let moved = move_aside(path);
+            Err(OpenFail::Other(why)) => return Err(why),
+            Err(OpenFail::Corrupt(why)) => {
+                let moved = move_aside(path)?;
                 warn(format!("the transcript database was corrupt ({why}); moved it to {moved} and started a new one"));
-                open_checked(path)?
+                match open_checked(path) {
+                    Ok(c) => c,
+                    Err(OpenFail::Corrupt(why) | OpenFail::Other(why)) => return Err(why),
+                }
             }
         };
         init(&conn)?;
@@ -442,25 +466,60 @@ impl Query {
     }
 }
 
+/// Runs `SELECT {select} {from_where}` newest first and returns the top `limit` rows
+/// plus every further row sharing the last one's `start_ms`, and whether anything
+/// older exists. `from_where` ends in conditions on alias `t`; `args` are its parameters.
+fn fetch_whole_ties<X>(
+    conn: &Connection,
+    select: &str,
+    from_where: &str,
+    mut args: Vec<Value>,
+    limit: usize,
+    read: impl Fn(&SqlRow) -> rusqlite::Result<(Row, X)>,
+) -> Result<(Vec<(Row, X)>, bool), String> {
+    let run = |sql: &str, args: Vec<Value>| -> Result<Vec<(Row, X)>, String> {
+        let mut st = conn.prepare(sql).map_err(err)?;
+        st.query_map(params_from_iter(args), &read).map_err(err)?.collect::<Result<_, _>>().map_err(err)
+    };
+    let mut with_limit = args.clone();
+    with_limit.push(Value::Integer(limit as i64 + 1));
+    let mut rows = run(&format!("SELECT {select} {from_where} ORDER BY t.start_ms DESC, t.path DESC LIMIT ?"), with_limit)?;
+    if rows.len() <= limit {
+        return Ok((rows, false));
+    }
+    if limit == 0 {
+        return Ok((Vec::new(), true));
+    }
+    let edge = rows[limit - 1].0.start_ms;
+    if rows[limit].0.start_ms != edge {
+        rows.truncate(limit);
+        return Ok((rows, true));
+    }
+    // The tie runs past the limit: take all of it.
+    rows.retain(|(r, _)| r.start_ms != edge);
+    let mut tied = args.clone();
+    tied.push(Value::Integer(edge));
+    rows.extend(run(&format!("SELECT {select} {from_where} AND t.start_ms = ? ORDER BY t.path DESC"), tied)?);
+    args.push(Value::Integer(edge));
+    let older = conn.prepare(&format!("SELECT 1 {from_where} AND t.start_ms < ? LIMIT 1")).and_then(|mut st| st.exists(params_from_iter(args))).map_err(err)?;
+    Ok((rows, older))
+}
+
 impl Store {
-    /// Newest first.
+    /// Newest first. A page never splits a run of rows that share a `start_ms`
+    /// (the cursor is only a time), so it may hold more than `limit` rows.
     pub fn page(&self, q: &Query) -> Result<Page, String> {
-        let (cond, mut args) = q.conditions();
-        args.push(Value::Integer(q.limit as i64 + 1));
-        let sql = format!("SELECT {COLUMNS} FROM transcripts t WHERE 1=1{cond} ORDER BY t.start_ms DESC, t.path DESC LIMIT ?");
+        let (cond, args) = q.conditions();
+        let from_where = format!("FROM transcripts t WHERE 1=1{cond}");
         let conn = self.conn()?;
-        let mut rows: Vec<Row> = {
-            let mut st = conn.prepare(&sql).map_err(err)?;
-            st.query_map(params_from_iter(args), read_row).map_err(err)?.collect::<Result<_, _>>().map_err(err)?
-        };
-        let more = rows.len() > q.limit;
-        rows.truncate(q.limit);
-        let before = rows.last().map_or(0, |r| r.start_ms);
-        Ok(Page { rows: with_segments(&conn, rows)?, more, before })
+        let (rows, more) = fetch_whole_ties(&conn, COLUMNS, &from_where, args, q.limit, |r| Ok((read_row(r)?, ())))?;
+        let before = rows.last().map_or(0, |(r, _)| r.start_ms);
+        let rows = with_segments(&conn, rows.into_iter().map(|(r, _)| r).collect())?;
+        Ok(Page { rows, more, before })
     }
 
     /// Full-text search over the transcripts that have text; each hit carries
-    /// its snippet. Returns `(hits, more, before)` like a page.
+    /// its snippet. Returns `(hits, more, before)` like a page, with the same tie rule.
     #[allow(clippy::type_complexity)]
     pub fn search(&self, text: &str, q: &Query) -> Result<(Vec<(Row, Vec<SegmentRow>, String)>, bool, i64), String> {
         let m = fts_query(text);
@@ -470,19 +529,13 @@ impl Store {
         let (cond, rest) = q.conditions();
         let mut args = vec![Value::Text(m)];
         args.extend(rest);
-        args.push(Value::Integer(q.limit as i64 + 1));
-        let sql = format!(
-            "SELECT {COLUMNS}, snippet(transcripts_fts, 0, '<b>', '</b>', '…', 12) \
-             FROM transcripts_fts JOIN transcripts t ON t.rowid = transcripts_fts.rowid \
-             WHERE transcripts_fts MATCH ? AND t.status = 'ok'{cond} ORDER BY t.start_ms DESC, t.path DESC LIMIT ?"
+        let select = format!("{COLUMNS}, snippet(transcripts_fts, 0, '<b>', '</b>', '…', 12)");
+        let from_where = format!(
+            "FROM transcripts_fts JOIN transcripts t ON t.rowid = transcripts_fts.rowid \
+             WHERE transcripts_fts MATCH ? AND t.status = 'ok'{cond}"
         );
         let conn = self.conn()?;
-        let mut found: Vec<(Row, String)> = {
-            let mut st = conn.prepare(&sql).map_err(err)?;
-            st.query_map(params_from_iter(args), |r| Ok((read_row(r)?, r.get::<_, String>(17)?))).map_err(err)?.collect::<Result<_, _>>().map_err(err)?
-        };
-        let more = found.len() > q.limit;
-        found.truncate(q.limit);
+        let (found, more) = fetch_whole_ties(&conn, &select, &from_where, args, q.limit, |r| Ok((read_row(r)?, r.get::<_, String>(17)?)))?;
         let before = found.last().map_or(0, |(r, _)| r.start_ms);
         let hits = found
             .into_iter()
@@ -668,5 +721,65 @@ mod tests {
         s.0.lock().unwrap().pragma_update(None, "user_version", 2).unwrap();
         drop(s);
         assert!(Store::open(&p, &|_| {}).unwrap_err().contains("newer"));
+    }
+
+    #[test]
+    fn a_page_never_splits_rows_that_share_a_start() {
+        let s = Store::in_memory();
+        for (p, t) in [("n0", 5000), ("n1", 4000), ("t0", 3000), ("t1", 3000), ("t2", 3000), ("t3", 3000), ("o0", 1000)] {
+            s.put(&row(p, t, Status::Ok, Some("tie")), &[]).unwrap();
+        }
+        let all = ["n0", "n1", "t3", "t2", "t1", "t0", "o0"];
+        let first = s.page(&Query { limit: 3, ..Default::default() }).unwrap();
+        assert_eq!((first.rows.len(), first.more, first.before), (6, true, 3000));
+        for limit in 1..=8 {
+            let (mut got, mut before) = (Vec::new(), None);
+            loop {
+                let p = s.page(&Query { limit, before, ..Default::default() }).unwrap();
+                got.extend(p.rows.into_iter().map(|h| h.0.path));
+                if !p.more {
+                    break;
+                }
+                before = Some(p.before);
+            }
+            assert_eq!(got, all, "page, limit {limit}");
+            let (mut got, mut before) = (Vec::new(), None);
+            loop {
+                let (hits, more, b) = s.search("tie", &Query { limit, before, ..Default::default() }).unwrap();
+                got.extend(hits.into_iter().map(|h| h.0.path));
+                if !more {
+                    break;
+                }
+                before = Some(b);
+            }
+            assert_eq!(got, all, "search, limit {limit}");
+        }
+    }
+
+    #[test]
+    fn the_full_text_index_follows_a_replace() {
+        let s = Store::in_memory();
+        s.put(&row("a", 1000, Status::Ok, Some("alpha")), &[]).unwrap();
+        s.put(&row("a", 1000, Status::Ok, Some("beta")), &[]).unwrap();
+        let q = Query { limit: 10, ..Default::default() };
+        assert_eq!(s.search("alpha", &q).unwrap().0.len(), 0);
+        assert_eq!(s.search("beta", &q).unwrap().0.len(), 1);
+        s.0.lock().unwrap().execute("INSERT INTO transcripts_fts(transcripts_fts) VALUES('integrity-check')", []).unwrap();
+    }
+
+    #[test]
+    fn a_locked_database_is_an_error_and_left_in_place() {
+        let dir = testing::temp_dir("store-locked");
+        let p = dir.join("transcripts.sqlite");
+        drop(Store::open(&p, &|_| {}).unwrap());
+        let holder = rusqlite::Connection::open(&p).unwrap();
+        holder.execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE;").unwrap();
+        let warned = std::cell::RefCell::new(Vec::new());
+        let r = Store::open(&p, &|m| warned.borrow_mut().push(m));
+        assert!(r.is_err());
+        assert!(warned.borrow().is_empty());
+        assert!(!std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".corrupt-")));
+        drop(holder);
+        assert!(Store::open(&p, &|_| {}).is_ok());
     }
 }
