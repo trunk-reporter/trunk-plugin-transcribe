@@ -5,3 +5,5 @@ pub mod config;
 pub mod filter;
 pub mod gate;
 pub mod plugin;
+pub mod prompt;
+pub mod segment;
