@@ -275,7 +275,7 @@ pub fn record_failed(ctx: &Ctx, job: &Job, reason: &str) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::audio::{read_wav, sine, write_temp};
     use crate::queue::Kind;
@@ -306,7 +306,7 @@ mod tests {
     }
 
     /// `testing::call` with 3 s of a 0.3-amplitude 1 kHz tone at 8 kHz in place of its silence, and no M4A.
-    fn speech_call(dir: &Path, tg: u32) -> ConcludedCall {
+    pub(crate) fn speech_call(dir: &Path, tg: u32) -> ConcludedCall {
         let mut c = testing::call(dir, "sys1", tg);
         let spec = hound::WavSpec { channels: 1, sample_rate: 8000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
         let mut w = hound::WavWriter::create(&c.files.wav, spec).unwrap();
