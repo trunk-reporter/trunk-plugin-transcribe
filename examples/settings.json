@@ -1,0 +1,58 @@
+{
+  "engine": {
+    "url": "http://eddie:8766",
+    "model": "default",
+    "apiKey": null,
+    "language": "en",
+    "timeoutSeconds": 60,
+    "concurrency": 2
+  },
+  "gate": {
+    "rms": 0.01,
+    "minSeconds": 1.0,
+    "skipEncrypted": true
+  },
+  "prepare": {
+    "p25Filter": false
+  },
+  "prompt": {
+    "enabled": true,
+    "extra": ""
+  },
+  "filter": {
+    "maxWordsPerSecond": 8.0,
+    "maxRepeat": 4,
+    "hallucinations": [
+      "Thank you for watching",
+      "Thanks for watching",
+      "Thank you for listening",
+      "Thank you",
+      "Thanks",
+      "Please subscribe",
+      "Subtitles by the Amara.org community",
+      "Subscribe to my channel",
+      "Bye",
+      "Goodbye",
+      "you",
+      "The end",
+      "Music",
+      "Applause"
+    ]
+  },
+  "queue": {
+    "max": 2000
+  },
+  "archive": {
+    "days": 7,
+    "everyMinutes": 10,
+    "retranscribeEverything": false
+  },
+  "store": {
+    "retentionDays": 0
+  },
+  "http": {
+    "port": 8767,
+    "bind": "127.0.0.1",
+    "origins": ["http://localhost:5173"]
+  }
+}
