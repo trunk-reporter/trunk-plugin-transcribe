@@ -61,7 +61,7 @@ pub fn resample_to_16k(pcm: &Pcm) -> Vec<f32> {
     (0..out_len)
         .map(|n| {
             let t = n as f64 * step;
-            let centre = t.floor() as i64;
+            let centre = t.round() as i64; // the 33 nearest input samples
             let (mut acc, mut weights) = (0.0, 0.0);
             for k in centre - HALF_TAPS..=centre + HALF_TAPS {
                 let w = kernel(k as f64 - t);
@@ -70,6 +70,7 @@ pub fn resample_to_16k(pcm: &Pcm) -> Vec<f32> {
                     acc += w * *s as f64;
                 }
             }
+            // Dividing by the weight sum gives unity DC gain, deliberately.
             (acc / weights) as f32
         })
         .collect()
