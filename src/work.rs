@@ -188,12 +188,17 @@ pub fn process(ctx: &Ctx, job: &Job, warn: &dyn Fn(String)) -> Done {
         return skip(ctx, job, settings, "system disabled", warn);
     }
 
-    // 2. The audio.
+    // 2. The talkgroup and category lists, before any audio is read.
+    if let Some(reason) = gate::check_talkgroup(record, &settings.gate) {
+        return skip(ctx, job, settings, reason, warn);
+    }
+
+    // 3. The audio.
     let Some(source) = find_audio(ctx, job) else {
         return skip(ctx, job, settings, "no audio", warn);
     };
 
-    // 3. The gate.
+    // 4. The gate.
     let loaded = match source {
         Source::Wav(path) => match audio::read_wav(&path) {
             Ok(pcm) => Loaded::Wav(pcm),
@@ -209,16 +214,16 @@ pub fn process(ctx: &Ctx, job: &Job, warn: &dyn Fn(String)) -> Done {
         return skip(ctx, job, settings, reason, warn);
     }
 
-    // 4. Prepare.
+    // 5. Prepare.
     let upload = match prepare(loaded, settings) {
         Ok(upload) => upload,
         Err(e) => return Done::Local(e),
     };
 
-    // 5. The prompt.
+    // 6. The prompt.
     let prompt = prompt::build(record, &system.name, &settings.prompt);
 
-    // 6. The engine.
+    // 7. The engine.
     let audio = engine::Audio { bytes: &upload.bytes, file_name: upload.file_name, content_type: upload.content_type };
     let started = Instant::now();
     let answer = match ctx.engine.transcribe(&settings.engine, audio, &settings.engine.language, &prompt) {
@@ -228,7 +233,7 @@ pub fn process(ctx: &Ctx, job: &Job, warn: &dyn Fn(String)) -> Done {
     };
     let took = started.elapsed();
 
-    // 7. The filters.
+    // 8. The filters.
     let length_s = length_ms(record) as f64 / 1000.0;
     let (status, reason) = match filter::check(&answer.text, length_s, &settings.filter) {
         Verdict::Ok => (Status::Ok, None),
@@ -239,10 +244,10 @@ pub fn process(ctx: &Ctx, job: &Job, warn: &dyn Fn(String)) -> Done {
         }
     };
 
-    // 8. The segments.
+    // 9. The segments.
     let segments = if status == Status::Ok { segments_of(&answer, &record.src_list, length_s) } else { Vec::new() };
 
-    // 9. The row.
+    // 10. The row.
     let Answer { text, language, model, raw, .. } = answer;
     let row = Row {
         text: (status == Status::Ok).then_some(text),
@@ -254,7 +259,7 @@ pub fn process(ctx: &Ctx, job: &Job, warn: &dyn Fn(String)) -> Done {
         ..row_for(job, settings, status, reason)
     };
 
-    // 10. Store and announce.
+    // 11. Store and announce.
     if let Err(e) = write(ctx, &row, &segments) {
         return Done::Local(e);
     }
@@ -381,6 +386,35 @@ pub(crate) mod tests {
         let (row, _) = ctx.store.get(&silent.path).unwrap().unwrap();
         assert_eq!((row.status, row.reason.as_deref(), row.text.as_deref()), (Status::Skipped, Some("silent"), None));
         assert_eq!((row.engine.as_str(), row.model_asked.as_str()), (s.url().trim_start_matches("http://"), "default"));
+    }
+
+    #[test]
+    fn the_talkgroup_lists_skip_before_the_audio_and_the_network() {
+        use crate::config::{CategoryList, ListMode, TalkgroupList};
+        let s = MockServer::start(|_| (200, OK.into()));
+        let ctx = ctx(s.url());
+        let dir = testing::temp_dir("work");
+        {
+            let gate = &mut ctx.systems.write().unwrap()[0].settings.gate;
+            gate.talkgroups = TalkgroupList { mode: ListMode::Allowlist, list: vec![101, 102] };
+            gate.categories = CategoryList { mode: ListMode::Denylist, list: vec!["Public Works".into()] };
+        }
+        let mut other = speech_call(&dir, 201);
+        other.files.wav = dir.join("nowhere.wav"); // not read: the list decides first
+        assert!(matches!(process(&ctx, &job(other.clone()), &|_| {}), Done::Skipped(m) if m == "talkgroup not allowed"));
+        let (row, _) = ctx.store.get(&other.path).unwrap().unwrap();
+        assert_eq!((row.status, row.reason.as_deref(), row.talkgroup), (Status::Skipped, Some("talkgroup not allowed"), 201));
+
+        let mut works = speech_call(&dir, 102);
+        works.call.talkgroup_group_tag = "public works".into();
+        let archived = Job { kind: Kind::Archive, ..job(works.clone()) };
+        assert!(matches!(process(&ctx, &archived, &|_| {}), Done::Skipped(m) if m == "category denied"), "the archive pass too");
+        assert!(s.requests().is_empty());
+
+        let mut dispatch = speech_call(&dir, 101);
+        dispatch.call.talkgroup_group_tag = "Fire Dispatch".into();
+        assert!(matches!(process(&ctx, &job(dispatch), &|_| {}), Done::Ok { .. }));
+        assert_eq!(s.requests().len(), 1);
     }
 
     #[test]

@@ -10,7 +10,15 @@
   "gate": {
     "rms": 0.01,
     "minSeconds": 1.0,
-    "skipEncrypted": true
+    "skipEncrypted": true,
+    "talkgroups": {
+      "mode": "denylist",
+      "list": []
+    },
+    "categories": {
+      "mode": "denylist",
+      "list": []
+    }
   },
   "prepare": {
     "p25Filter": false

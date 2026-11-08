@@ -42,6 +42,10 @@ Settings are applied while the recorder runs, except the five marked (restart) b
 | `gate.rms` | `0.01` | Calls quieter than this are skipped as silence. |
 | `gate.minSeconds` | `1.0` | Calls shorter than this are skipped. |
 | `gate.skipEncrypted` | `true` | Leave encrypted calls out. |
+| `gate.talkgroups.mode` | `denylist` | `allowlist`: transcribe only the talkgroups listed. `denylist`: all but them. |
+| `gate.talkgroups.list` | none | Talkgroup numbers. Empty: every talkgroup (in either mode). |
+| `gate.categories.mode` | `denylist` | `allowlist`: transcribe only talkgroups whose tag or group is listed. `denylist`: all but them. |
+| `gate.categories.list` | none | Tags or groups from the talkgroup file, e.g. `Law Dispatch` or `Fire`; case does not matter. Empty: every talkgroup. |
 | `prepare.p25Filter` | `false` | Filter the audio for P25 vocoder artifacts before sending it. |
 | `prompt.enabled` | `true` | Prime the engine with the talkgroup's name and tag. |
 | `prompt.extra` | empty | Added to every prompt, e.g. local place names and codes. |
@@ -64,11 +68,35 @@ Two buttons sit on the settings form:
 
 Per system: `enabled` (default on) turns transcribing off for one system; its calls are recorded as skipped.
 
+### Choosing talkgroups
+
+On a busy system, transcribing every talkgroup can swamp the engine or, with a paid API, the bill. The two lists under
+`gate` choose which calls go to the engine:
+
+```json
+"gate": {
+  "talkgroups": { "mode": "denylist", "list": [3001, 3002] },
+  "categories": { "mode": "allowlist", "list": ["Law Dispatch", "Fire Dispatch", "Law Tac", "Fire-Tac"] }
+}
+```
+
+- A **category** matches the talkgroup's tag (the talkgroup file's Tag column, e.g. `Law Dispatch`) or its group
+  (Category/Group, e.g. `Fire`), ignoring case. A talkgroup with neither is not in any category, so an allowlist leaves
+  it out.
+- A call has to pass **both** lists. The example transcribes dispatch and tactical talkgroups, except 3001 and 3002.
+- An **empty list** passes every call, even as an allowlist.
+- They are checked before the audio is read, so a call left out costs no conversion and no request. Its record is
+  `skipped` with the reason `talkgroup not allowed`, `talkgroup denied`, `category not allowed` or `category denied`.
+- The archive pass goes through the same check. A call already recorded as skipped stays skipped if you change the lists
+  later, as with a disabled system.
+- Like every setting, a system can override them, so each system can have its own lists.
+
 ## What happens to a call
 
 When a call concludes, the plugin:
 
-1. Gates it: encrypted (if `gate.skipEncrypted`), shorter than `gate.minSeconds` or quieter than `gate.rms` is skipped.
+1. Gates it: a talkgroup the lists leave out (`gate.talkgroups`, `gate.categories`), encrypted (if `gate.skipEncrypted`),
+   shorter than `gate.minSeconds` or quieter than `gate.rms` is skipped.
 2. Converts the recorder's WAV to 16 kHz mono WAV, through the P25 filter chain if `prepare.p25Filter` is on. An M4A is
    posted as it is.
 3. Posts it to `/v1/audio/transcriptions` with `verbose_json` and word timestamps, and the prompt if enabled.
@@ -100,7 +128,7 @@ Each call has one transcript record, with a `status` and sometimes a `reason`:
 | Status | Meaning |
 | --- | --- |
 | `ok` | Text is stored, with segments per radio when the engine gave word times. |
-| `skipped` | Not sent. Reason: `encrypted`, `too short`, `silent`, `system disabled` or `no audio`. |
+| `skipped` | Not sent. Reason: `encrypted`, `too short`, `silent`, `system disabled`, `talkgroup not allowed`, `talkgroup denied`, `category not allowed`, `category denied` or `no audio`. |
 | `empty` | The engine returned no words. |
 | `rejected` | Thrown out by a filter; the raw answer is kept, the text is not. Reason: `implausible rate`, `repetition` or `hallucination`. |
 | `failed` | Not transcribed. Reason: the engine's error, `gave up: ...`, `engine down`, `queue full` or `shutting down`. The archive pass retries it, up to 10 attempts. A call the archive pass queued but that was never tried gets no record and counts no attempt. |
