@@ -1,3 +1,9 @@
+## Unreleased
+
+- Choosing talkgroups: `gate.talkgroups` and `gate.categories` (each an allowlist or a denylist) decide which calls are
+  transcribed, by talkgroup number or by the talkgroup's tag or group. Checked before the audio is read; calls left out
+  are recorded as skipped with the reason. Per system through the usual overrides. ([#1](https://github.com/trunk-reporter/trunk-plugin-transcribe/issues/1))
+
 ## [0.1.0]
 
 - The live path: each concluded call is gated, prepared (optional P25 filter) and sent to an OpenAI-style transcription engine.

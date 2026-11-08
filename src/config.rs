@@ -106,12 +106,56 @@ pub struct GateConfig {
     ///
     /// Encrypted calls are noise; leave them out.
     pub skip_encrypted: bool,
+    /// Talkgroups
+    ///
+    /// Which talkgroups to transcribe, by number. An empty list leaves every talkgroup in.
+    pub talkgroups: TalkgroupList,
+    /// Categories
+    ///
+    /// Which talkgroups to transcribe, by the tag or the group (category) the talkgroup file gives them, e.g. "Law Dispatch"
+    /// or "Fire". Case does not matter. An empty list leaves every talkgroup in.
+    pub categories: CategoryList,
 }
 
 impl Default for GateConfig {
     fn default() -> Self {
-        GateConfig { rms: 0.01, min_seconds: 1.0, skip_encrypted: true }
+        GateConfig { rms: 0.01, min_seconds: 1.0, skip_encrypted: true, talkgroups: TalkgroupList::default(), categories: CategoryList::default() }
     }
+}
+
+/// How a list of talkgroups or categories is used (each variant's doc comment is its label on the form's menu).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ListMode {
+    /// Only these
+    Allowlist,
+    /// All but these
+    #[default]
+    Denylist,
+}
+
+/// Talkgroups to transcribe or to leave out, by number.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TalkgroupList {
+    /// Transcribe
+    ///
+    /// Only the talkgroups listed, or all but them.
+    pub mode: ListMode,
+    /// Talkgroup numbers
+    pub list: Vec<u32>,
+}
+
+/// Talkgroups to transcribe or to leave out, by their tag or group.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CategoryList {
+    /// Transcribe
+    ///
+    /// Only the talkgroups whose tag or group is listed, or all but them.
+    pub mode: ListMode,
+    /// Tags and groups
+    pub list: Vec<String>,
 }
 
 /// How the audio is prepared.
@@ -319,5 +363,26 @@ mod tests {
         assert_eq!(ids, ["test", "retranscribe"]);
         assert_eq!(s["properties"]["engine"]["properties"]["apiKey"]["x-secret"], true);
         assert_eq!(s["properties"]["engine"]["required"], serde_json::json!(["url"]));
+    }
+
+    #[test]
+    fn the_example_settings_load() {
+        let c: Config = serde_json::from_str(include_str!("../examples/settings.json")).unwrap();
+        assert!(c.validate().is_ok());
+        assert_eq!((c.gate.talkgroups.mode, c.gate.categories.list.len()), (ListMode::Denylist, 0));
+    }
+
+    #[test]
+    fn the_talkgroup_lists_are_menus_and_lists_off_by_default() {
+        let c = Config::default();
+        assert!(c.gate.talkgroups.list.is_empty() && c.gate.categories.list.is_empty());
+        assert_eq!((c.gate.talkgroups.mode, c.gate.categories.mode), (ListMode::Denylist, ListMode::Denylist));
+        let s = trunk_recorder_plugin::schema::schema_for::<Config>();
+        let tgs = &s["properties"]["gate"]["properties"]["talkgroups"]["properties"];
+        assert_eq!(tgs["mode"]["enum"], serde_json::json!(["allowlist", "denylist"]));
+        assert_eq!(tgs["mode"]["x-enum-labels"], serde_json::json!(["Only these", "All but these"]));
+        assert_eq!(tgs["list"]["type"], "array");
+        let g: GateConfig = serde_json::from_value(serde_json::json!({ "categories": { "mode": "allowlist", "list": ["Law Dispatch"] } })).unwrap();
+        assert_eq!((g.categories.mode, g.categories.list.as_slice(), g.rms), (ListMode::Allowlist, &["Law Dispatch".to_string()][..], 0.01));
     }
 }
